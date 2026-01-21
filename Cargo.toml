@@ -1,0 +1,30 @@
+[package]
+name = "folco-renderer"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+canvas = ["wasm-bindgen", "web-sys", "js-sys"]
+twemoji = ["dep:twemoji-assets"]
+
+[dependencies]
+image = "0.25"
+palette = "0.7"
+resvg = "0.44"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+twemoji-assets = { version = "1.5", optional = true, default-features = false, features = ["svg"] }
+
+# Optional dependencies for canvas feature (WASM)
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+
+[dependencies.web-sys]
+version = "0.3"
+optional = true
+features = [
+    "CanvasRenderingContext2d",
+    "HtmlCanvasElement",
+    "ImageData",
+]
