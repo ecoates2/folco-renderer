@@ -1,7 +1,7 @@
-//! Serializable customization profile for cross-process/WASM communication.
+//! Serializable customization profile for cross-process communication.
 //!
 //! A [`CustomizationProfile`] captures all layer settings in a format that can
-//! be serialized to JSON and sent between frontend (WASM/Tauri) and backend.
+//! be serialized to JSON and sent between frontend and backend processes.
 //!
 //! # Example
 //!
@@ -191,8 +191,8 @@ fn default_true() -> bool {
 
 /// A serializable profile containing all customization settings.
 ///
-/// This is the primary type for communicating settings between WASM frontend
-/// and native backend. It captures layer configurations and enabled states
+/// This is the primary type for communicating settings between frontend
+/// and backend processes. It captures layer configurations and enabled states
 /// in a JSON-friendly format.
 ///
 /// # JSON Format

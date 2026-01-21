@@ -23,8 +23,9 @@
 //!
 //! # Serializable Profiles
 //!
-//! For WASM/frontend-backend communication, use [`CustomizationProfile`]
-//! with the [`Configurable`] trait:
+//! For frontend-backend communication, use [`CustomizationProfile`]
+//! with the [`Configurable`] trait. For WASM bindings, see the
+//! `folco-renderer-wasm` crate.
 //!
 //! ```
 //! use folco_renderer::{
@@ -49,13 +50,7 @@ mod icon;
 mod layer;
 mod profile;
 
-#[cfg(feature = "canvas")]
-mod canvas;
-
 pub use customizer::{Configurable, IconCustomizer};
-
-#[cfg(feature = "canvas")]
-pub use canvas::CanvasRenderer;
 pub use icon::{IconImage, IconSet, RectPx, SizePx};
 pub use layer::{
     CacheKey, DecalConfig, DominantColor, HueRotationConfig, Layer, LayerConfig, LayerPipeline,
