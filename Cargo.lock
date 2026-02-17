@@ -395,6 +395,7 @@ dependencies = [
  "resvg",
  "serde",
  "serde_json",
+ "thiserror",
  "twemoji-assets",
 ]
 

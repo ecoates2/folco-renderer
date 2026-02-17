@@ -1,18 +1,23 @@
-//! Serializable customization profile for cross-process communication.
+//! Serializable customization profile for cross-process/WASM communication.
 //!
 //! A [`CustomizationProfile`] captures all layer settings in a format that can
-//! be serialized to JSON and sent between frontend and backend processes.
+//! be serialized to JSON and sent between frontend (WASM/Tauri) and backend.
 //!
 //! # Example
 //!
 //! ```
 //! use folco_renderer::{
-//!     CustomizationProfile, HueRotationSettings, DecalSettings, SerializableSvgSource,
+//!     CustomizationProfile, HslMutationSettings, DecalSettings, SerializableSvgSource,
 //! };
 //!
 //! // Build a profile
 //! let profile = CustomizationProfile::new()
-//!     .with_hue_rotation(HueRotationSettings { degrees: 180.0, enabled: true })
+//!     .with_hsl_mutation(HslMutationSettings {
+//!         target_hue: 180.0,
+//!         target_saturation: 0.8,
+//!         target_lightness: 0.5,
+//!         enabled: true,
+//!     })
 //!     .with_decal(DecalSettings {
 //!         source: SerializableSvgSource::from_svg("<svg>...</svg>"),
 //!         scale: 0.5,
@@ -46,13 +51,17 @@ use crate::layer::{OverlayPosition, SvgSource};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SerializableSvgSource {
-    /// Raw SVG markup (mutually exclusive with `emoji`).
+    /// Raw SVG markup (mutually exclusive with `emoji` and `emoji_name`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub svg_data: Option<String>,
 
-    /// Emoji character to resolve via twemoji (mutually exclusive with `svg_data`).
+    /// Emoji character to resolve via twemoji (mutually exclusive with `svg_data` and `emoji_name`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub emoji: Option<String>,
+
+    /// Emoji name to resolve via twemoji (mutually exclusive with `svg_data` and `emoji`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emoji_name: Option<String>,
 }
 
 impl SerializableSvgSource {
@@ -61,6 +70,7 @@ impl SerializableSvgSource {
         Self {
             svg_data: Some(svg.into()),
             emoji: None,
+            emoji_name: None,
         }
     }
 
@@ -69,6 +79,16 @@ impl SerializableSvgSource {
         Self {
             svg_data: None,
             emoji: Some(emoji.into()),
+            emoji_name: None,
+        }
+    }
+
+    /// Creates a source from an emoji name (e.g., "duck").
+    pub fn from_emoji_name(name: impl Into<String>) -> Self {
+        Self {
+            svg_data: None,
+            emoji: None,
+            emoji_name: Some(name.into()),
         }
     }
 }
@@ -78,6 +98,7 @@ impl From<&SvgSource> for SerializableSvgSource {
         match source {
             SvgSource::Raw(svg) => Self::from_svg(svg),
             SvgSource::Emoji(emoji) => Self::from_emoji(emoji),
+            SvgSource::EmojiName(name) => Self::from_emoji_name(name),
         }
     }
 }
@@ -86,6 +107,8 @@ impl From<SerializableSvgSource> for SvgSource {
     fn from(source: SerializableSvgSource) -> Self {
         if let Some(emoji) = source.emoji {
             SvgSource::Emoji(emoji)
+        } else if let Some(name) = source.emoji_name {
+            SvgSource::EmojiName(name)
         } else if let Some(svg) = source.svg_data {
             SvgSource::Raw(svg)
         } else {
@@ -98,12 +121,23 @@ impl From<SerializableSvgSource> for SvgSource {
 // Layer Settings (Serializable)
 // ============================================================================
 
-/// Serializable settings for hue rotation layer.
+/// Serializable settings for HSL mutation layer.
+///
+/// Settings are expressed as a **target color** in HSL space. The renderer
+/// computes the necessary deltas from the base icon's surface color.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct HueRotationSettings {
-    /// Rotation angle in degrees (0-360).
-    pub degrees: f32,
+pub struct HslMutationSettings {
+    /// Target hue in degrees (0–360).
+    pub target_hue: f32,
+
+    /// Target saturation as a fraction (0.0–1.0).
+    #[serde(default)]
+    pub target_saturation: f32,
+
+    /// Target lightness as a fraction (0.0–1.0).
+    #[serde(default)]
+    pub target_lightness: f32,
 
     /// Whether this layer is enabled.
     #[serde(default = "default_true")]
@@ -191,16 +225,18 @@ fn default_true() -> bool {
 
 /// A serializable profile containing all customization settings.
 ///
-/// This is the primary type for communicating settings between frontend
-/// and backend processes. It captures layer configurations and enabled states
+/// This is the primary type for communicating settings between WASM frontend
+/// and native backend. It captures layer configurations and enabled states
 /// in a JSON-friendly format.
 ///
 /// # JSON Format
 ///
 /// ```json
 /// {
-///   "hueRotation": {
-///     "degrees": 180.0,
+///   "hslMutation": {
+///     "targetHue": 180.0,
+///     "targetSaturation": 0.8,
+///     "targetLightness": 0.5,
 ///     "enabled": true
 ///   },
 ///   "decal": {
@@ -214,9 +250,9 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomizationProfile {
-    /// Hue rotation layer settings. `None` means no config set.
+    /// HSL mutation layer settings. `None` means no config set.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub hue_rotation: Option<HueRotationSettings>,
+    pub hsl_mutation: Option<HslMutationSettings>,
 
     /// Decal imprint layer settings. `None` means no config set.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -233,9 +269,9 @@ impl CustomizationProfile {
         Self::default()
     }
 
-    /// Sets hue rotation settings.
-    pub fn with_hue_rotation(mut self, settings: HueRotationSettings) -> Self {
-        self.hue_rotation = Some(settings);
+    /// Sets HSL mutation settings.
+    pub fn with_hsl_mutation(mut self, settings: HslMutationSettings) -> Self {
+        self.hsl_mutation = Some(settings);
         self
     }
 
@@ -278,8 +314,10 @@ mod tests {
     #[test]
     fn profile_serialization_roundtrip() {
         let profile = CustomizationProfile::new()
-            .with_hue_rotation(HueRotationSettings {
-                degrees: 180.0,
+            .with_hsl_mutation(HslMutationSettings {
+                target_hue: 180.0,
+                target_saturation: 0.8,
+                target_lightness: 0.5,
                 enabled: true,
             })
             .with_decal(DecalSettings {
@@ -291,8 +329,10 @@ mod tests {
         let json = profile.to_json().unwrap();
         let restored = CustomizationProfile::from_json(&json).unwrap();
 
-        assert_eq!(restored.hue_rotation.as_ref().unwrap().degrees, 180.0);
-        assert!(restored.hue_rotation.as_ref().unwrap().enabled);
+        assert_eq!(restored.hsl_mutation.as_ref().unwrap().target_hue, 180.0);
+        assert_eq!(restored.hsl_mutation.as_ref().unwrap().target_saturation, 0.8);
+        assert_eq!(restored.hsl_mutation.as_ref().unwrap().target_lightness, 0.5);
+        assert!(restored.hsl_mutation.as_ref().unwrap().enabled);
         assert_eq!(
             restored.decal.as_ref().unwrap().source.svg_data.as_deref(),
             Some("<svg></svg>")
@@ -303,28 +343,32 @@ mod tests {
 
     #[test]
     fn profile_json_format() {
-        let profile = CustomizationProfile::new().with_hue_rotation(HueRotationSettings {
-            degrees: 90.0,
+        let profile = CustomizationProfile::new().with_hsl_mutation(HslMutationSettings {
+            target_hue: 90.0,
+            target_saturation: 0.8,
+            target_lightness: 0.5,
             enabled: true,
         });
 
         let json = profile.to_json_pretty().unwrap();
 
         // Verify camelCase serialization
-        assert!(json.contains("\"hueRotation\""));
-        assert!(json.contains("\"degrees\""));
+        assert!(json.contains("\"hslMutation\""));
+        assert!(json.contains("\"targetHue\""));
         assert!(json.contains("\"enabled\""));
     }
 
     #[test]
     fn profile_apply_to_customizer() {
         use crate::customizer::Configurable;
-        use crate::icon::IconSet;
+        use crate::icon::{IconBase, IconSet, SurfaceColor};
         use crate::IconCustomizer;
 
         let profile = CustomizationProfile::new()
-            .with_hue_rotation(HueRotationSettings {
-                degrees: 120.0,
+            .with_hsl_mutation(HslMutationSettings {
+                target_hue: 120.0,
+                target_saturation: 0.8,
+                target_lightness: 0.5,
                 enabled: true,
             })
             .with_decal(DecalSettings {
@@ -333,12 +377,12 @@ mod tests {
                 enabled: false, // Disabled but config present
             });
 
-        let mut customizer = IconCustomizer::new(IconSet::new());
+        let mut customizer = IconCustomizer::new(IconBase::new(IconSet::new(), SurfaceColor::new(44.0, 1.0, 0.72)));
         customizer.apply_profile(&profile);
 
-        // Check hue
-        assert!(customizer.pipeline.hue.is_active());
-        assert_eq!(customizer.pipeline.hue.config().unwrap().degrees, 120.0);
+        // Check HSL — target values are stored directly
+        assert!(customizer.pipeline.hsl.is_active());
+        assert!((customizer.pipeline.hsl.config().unwrap().target_hue - 120.0).abs() < 0.01);
 
         // Check decal (has config but disabled)
         assert!(customizer.pipeline.decal.has_config());
@@ -353,22 +397,26 @@ mod tests {
     #[test]
     fn profile_export_from_customizer() {
         use crate::customizer::Configurable;
-        use crate::icon::IconSet;
-        use crate::layer::HueRotationConfig;
+        use crate::icon::{IconBase, IconSet, SurfaceColor};
+        use crate::layer::HslMutationConfig;
         use crate::IconCustomizer;
 
-        let mut customizer = IconCustomizer::new(IconSet::new());
+        let surface = SurfaceColor::new(44.0, 1.0, 0.72);
+        let mut customizer = IconCustomizer::new(IconBase::new(IconSet::new(), surface));
         customizer
             .pipeline
-            .hue
-            .set_config(Some(HueRotationConfig::new(45.0)));
-        customizer.pipeline.hue.set_enabled(false);
+            .hsl
+            .set_config(Some(HslMutationConfig::new(&surface, 89.0, 1.0, 0.648)));
+        customizer.pipeline.hsl.set_enabled(false);
 
         let profile = customizer.export_profile();
 
-        assert!(profile.hue_rotation.is_some());
-        assert_eq!(profile.hue_rotation.as_ref().unwrap().degrees, 45.0);
-        assert!(!profile.hue_rotation.as_ref().unwrap().enabled);
+        // Export reads target HSL directly from the config
+        assert!(profile.hsl_mutation.is_some());
+        assert!((profile.hsl_mutation.as_ref().unwrap().target_hue - 89.0).abs() < 0.01);
+        assert!((profile.hsl_mutation.as_ref().unwrap().target_saturation - 1.0).abs() < 0.01);
+        assert!((profile.hsl_mutation.as_ref().unwrap().target_lightness - 0.648).abs() < 0.01);
+        assert!(!profile.hsl_mutation.as_ref().unwrap().enabled);
         assert!(profile.decal.is_none());
         assert!(profile.overlay.is_none());
     }
@@ -397,7 +445,7 @@ mod tests {
         let json = "{}";
         let profile = CustomizationProfile::from_json(json).unwrap();
 
-        assert!(profile.hue_rotation.is_none());
+        assert!(profile.hsl_mutation.is_none());
         assert!(profile.decal.is_none());
         assert!(profile.overlay.is_none());
     }

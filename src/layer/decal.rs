@@ -1,10 +1,12 @@
 //! Decal imprint layer configuration and application.
 
-use super::hue_rotation::sample_dominant_color;
 use super::svg::{composite_over, render_source_with_color, SvgSource};
 use super::{DependencyVersion, DominantColor, LayerConfig, LayerEffect, LayerVersions, RenderContext};
-use crate::icon::IconImage;
+use crate::error::RenderError;
+use crate::icon::{IconImage, SurfaceColor};
 use palette::{Hsl, IntoColor, Srgb};
+
+const DECAL_DARKEN_AMOUNT: f32 = 0.20;
 
 // ============================================================================
 // DecalConfig
@@ -21,7 +23,7 @@ use palette::{Hsl, IntoColor, Srgb};
 /// # Consumed Properties
 ///
 /// - [`DominantColor`]: If set by an upstream layer, uses this color for the decal.
-///   Otherwise, samples the dominant color from the current image.
+///   Otherwise, derives the color from the [`SurfaceColor`] in the render context.
 #[derive(Debug, Clone)]
 pub struct DecalConfig {
     /// The SVG source (should be a monochrome/single-color SVG).
@@ -65,19 +67,30 @@ impl LayerConfig for DecalConfig {
 }
 
 impl LayerEffect for DecalConfig {
-    /// Decal depends on the hue layer (consumes DominantColor).
+    /// Decal depends on the HSL mutation layer (consumes DominantColor).
     fn dependencies(versions: &LayerVersions) -> DependencyVersion {
-        DependencyVersion::from_version(versions.hue)
+        DependencyVersion::from_version(versions.hsl)
     }
 
-    fn transform(&self, ctx: &mut RenderContext) {
-        // Get dominant color from upstream layer, or sample it ourselves
+    fn transform(&self, ctx: &mut RenderContext) -> Result<(), RenderError> {
+        // Get dominant color from upstream layer, or derive from surface color
         let dominant_color = ctx
             .get::<DominantColor>()
             .map(|c| c.as_tuple())
-            .unwrap_or_else(|| sample_dominant_color(&ctx.image));
+            .unwrap_or_else(|| {
+                // No upstream DominantColor — convert surface color to RGB
+                let sc = ctx.get::<SurfaceColor>().expect("SurfaceColor must be set in RenderContext");
+                let hsl = Hsl::new(sc.hue, sc.saturation, sc.lightness);
+                let rgb: Srgb = hsl.into_color();
+                (
+                    (rgb.red * 255.0).round() as u8,
+                    (rgb.green * 255.0).round() as u8,
+                    (rgb.blue * 255.0).round() as u8,
+                    255,
+                )
+            });
 
-        let darkened = darken_color(dominant_color, 0.15);
+        let darkened = darken_color(dominant_color, DECAL_DARKEN_AMOUNT);
 
         // Calculate decal size based on content bounds
         let bounds = ctx.image.content_bounds;
@@ -85,14 +98,11 @@ impl LayerEffect for DecalConfig {
         let decal_size = (min_dim * self.scale) as u32;
 
         if decal_size == 0 {
-            return;
+            return Ok(());
         }
 
         // Render the SVG with the darkened color
-        let Some(decal_img) = render_source_with_color(&self.source, decal_size, Some(darkened))
-        else {
-            return;
-        };
+        let decal_img = render_source_with_color(&self.source, decal_size, Some(darkened))?;
 
         // Calculate centered position within content bounds
         let center_x = bounds.x as i32 + (bounds.width as i32 - decal_img.width() as i32) / 2;
@@ -103,6 +113,7 @@ impl LayerEffect for DecalConfig {
 
         // Update the IconImage with the modified data
         ctx.image = IconImage::new(ctx.image.data.clone(), ctx.image.scale, ctx.image.content_bounds);
+        Ok(())
     }
 }
 

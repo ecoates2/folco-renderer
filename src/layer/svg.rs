@@ -7,6 +7,8 @@ use image::{Rgba, RgbaImage};
 use resvg::tiny_skia::{Pixmap, Transform};
 use resvg::usvg::{Options, Tree};
 
+use crate::error::RenderError;
+
 // ============================================================================
 // SvgSource
 // ============================================================================
@@ -39,6 +41,12 @@ pub enum SvgSource {
     /// Only available when the `twemoji` feature is enabled.
     /// At render time, this is resolved to the corresponding Twemoji SVG.
     Emoji(String),
+
+    /// An emoji name (e.g., "duck") to be resolved via twemoji_assets.
+    ///
+    /// Only available when the `twemoji` feature is enabled with the `names` feature.
+    /// At render time, this is resolved to the corresponding Twemoji SVG.
+    EmojiName(String),
 }
 
 impl SvgSource {
@@ -49,38 +57,82 @@ impl SvgSource {
 
     /// Creates a source from an emoji character.
     ///
-    /// Returns `None` if the emoji is not supported by twemoji_assets.
+    /// Returns an error if the emoji is not supported by twemoji_assets.
     /// Only available when the `twemoji` feature is enabled.
     #[cfg(feature = "twemoji")]
-    pub fn from_emoji(emoji: &str) -> Option<Self> {
+    pub fn from_emoji(emoji: &str) -> Result<Self, RenderError> {
         use twemoji_assets::svg::SvgTwemojiAsset;
 
         // Validate that the emoji exists
-        SvgTwemojiAsset::from_emoji(emoji)?;
-        Some(Self::Emoji(emoji.to_string()))
+        SvgTwemojiAsset::from_emoji(emoji).ok_or_else(|| RenderError::InvalidEmoji {
+            emoji: emoji.to_string(),
+        })?;
+        Ok(Self::Emoji(emoji.to_string()))
+    }
+
+    /// Creates a source from an emoji name (e.g., "duck").
+    ///
+    /// Returns an error if the name is not recognized by twemoji_assets.
+    /// Only available when the `twemoji` feature is enabled.
+    #[cfg(feature = "twemoji")]
+    pub fn from_emoji_name(name: &str) -> Result<Self, RenderError> {
+        use twemoji_assets::svg::SvgTwemojiAsset;
+
+        // Validate that the emoji name exists
+        SvgTwemojiAsset::from_name(name).ok_or_else(|| RenderError::InvalidEmojiName {
+            name: name.to_string(),
+        })?;
+        Ok(Self::EmojiName(name.to_string()))
     }
 
     /// Resolves this source to SVG markup.
     ///
     /// For `Raw` sources, returns the SVG string directly.
     /// For `Emoji` sources, looks up the emoji in twemoji_assets.
-    pub fn resolve(&self) -> Option<&str> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - An emoji character or name cannot be resolved.
+    /// - An emoji source is used without the `twemoji` feature enabled.
+    pub fn resolve(&self) -> Result<&str, RenderError> {
         match self {
-            Self::Raw(svg) => Some(svg.as_str()),
+            Self::Raw(svg) => Ok(svg.as_str()),
             #[cfg(feature = "twemoji")]
             Self::Emoji(emoji) => {
                 use twemoji_assets::svg::SvgTwemojiAsset;
-                let asset = SvgTwemojiAsset::from_emoji(emoji)?;
-                Some(asset.as_ref())
+                let asset = SvgTwemojiAsset::from_emoji(emoji).ok_or_else(|| {
+                    RenderError::InvalidEmoji {
+                        emoji: emoji.clone(),
+                    }
+                })?;
+                Ok(asset.as_ref())
             }
             #[cfg(not(feature = "twemoji"))]
-            Self::Emoji(_) => None,
+            Self::Emoji(_) => Err(RenderError::TwemojiNotAvailable),
+            #[cfg(feature = "twemoji")]
+            Self::EmojiName(name) => {
+                use twemoji_assets::svg::SvgTwemojiAsset;
+                let asset = SvgTwemojiAsset::from_name(name).ok_or_else(|| {
+                    RenderError::InvalidEmojiName {
+                        name: name.clone(),
+                    }
+                })?;
+                Ok(asset.as_ref())
+            }
+            #[cfg(not(feature = "twemoji"))]
+            Self::EmojiName(_) => Err(RenderError::TwemojiNotAvailable),
         }
     }
 
     /// Returns `true` if this is an emoji source.
     pub fn is_emoji(&self) -> bool {
         matches!(self, Self::Emoji(_))
+    }
+
+    /// Returns `true` if this is an emoji name source.
+    pub fn is_emoji_name(&self) -> bool {
+        matches!(self, Self::EmojiName(_))
     }
 
     /// Returns `true` if this is a raw SVG source.
@@ -104,8 +156,11 @@ impl<S: Into<String>> From<S> for SvgSource {
 /// The SVG is scaled to fit within `size x size` pixels while preserving
 /// aspect ratio (the larger dimension will be `size`).
 ///
-/// Returns `None` if the SVG cannot be parsed or rendered.
-pub fn render_svg(svg_data: &str, size: u32) -> Option<RgbaImage> {
+/// # Errors
+///
+/// Returns an error if the SVG cannot be parsed or the pixel buffer
+/// cannot be allocated.
+pub fn render_svg(svg_data: &str, size: u32) -> Result<RgbaImage, RenderError> {
     render_svg_with_color(svg_data, size, None)
 }
 
@@ -114,12 +169,15 @@ pub fn render_svg(svg_data: &str, size: u32) -> Option<RgbaImage> {
 /// If `fill_color` is provided, all fills and strokes in the SVG are replaced
 /// with this color. This is useful for monochrome icon decals.
 ///
-/// Returns `None` if the SVG cannot be parsed or rendered.
+/// # Errors
+///
+/// Returns an error if the SVG cannot be parsed or the pixel buffer
+/// cannot be allocated.
 pub fn render_svg_with_color(
     svg_data: &str,
     size: u32,
     fill_color: Option<(u8, u8, u8, u8)>,
-) -> Option<RgbaImage> {
+) -> Result<RgbaImage, RenderError> {
     // Apply color replacement if needed
     let svg_data = if let Some((r, g, b, _a)) = fill_color {
         replace_svg_colors(svg_data, r, g, b)
@@ -129,7 +187,7 @@ pub fn render_svg_with_color(
 
     // Parse the SVG
     let opts = Options::default();
-    let tree = Tree::from_str(&svg_data, &opts).ok()?;
+    let tree = Tree::from_str(&svg_data, &opts)?;
 
     // Calculate scale to fit within size x size
     let svg_size = tree.size();
@@ -138,18 +196,22 @@ pub fn render_svg_with_color(
     let height = (svg_size.height() * scale).ceil() as u32;
 
     // Create pixmap and render
-    let mut pixmap = Pixmap::new(width, height)?;
+    let mut pixmap = Pixmap::new(width, height).ok_or(RenderError::PixmapCreation { width, height })?;
     let transform = Transform::from_scale(scale, scale);
     resvg::render(&tree, transform, &mut pixmap.as_mut());
 
     // Convert to RgbaImage
-    Some(pixmap_to_rgba_image(&pixmap))
+    Ok(pixmap_to_rgba_image(&pixmap))
 }
 
 /// Renders an [`SvgSource`] to an RGBA image at the specified size.
 ///
 /// This is a convenience wrapper around [`render_svg`] that handles source resolution.
-pub fn render_source(source: &SvgSource, size: u32) -> Option<RgbaImage> {
+///
+/// # Errors
+///
+/// Returns an error if the source cannot be resolved or the SVG cannot be parsed.
+pub fn render_source(source: &SvgSource, size: u32) -> Result<RgbaImage, RenderError> {
     let svg_data = source.resolve()?;
     render_svg(svg_data, size)
 }
@@ -157,11 +219,15 @@ pub fn render_source(source: &SvgSource, size: u32) -> Option<RgbaImage> {
 /// Renders an [`SvgSource`] to an RGBA image, optionally replacing all colors.
 ///
 /// This is a convenience wrapper around [`render_svg_with_color`] that handles source resolution.
+///
+/// # Errors
+///
+/// Returns an error if the source cannot be resolved or the SVG cannot be parsed.
 pub fn render_source_with_color(
     source: &SvgSource,
     size: u32,
     fill_color: Option<(u8, u8, u8, u8)>,
-) -> Option<RgbaImage> {
+) -> Result<RgbaImage, RenderError> {
     let svg_data = source.resolve()?;
     render_svg_with_color(svg_data, size, fill_color)
 }
@@ -321,20 +387,20 @@ mod tests {
 
     #[test]
     fn render_simple_svg() {
-        let result = render_svg(SIMPLE_SVG, 50);
-        assert!(result.is_some());
-
-        let img = result.unwrap();
+        let img = render_svg(SIMPLE_SVG, 50).unwrap();
         assert!(img.width() <= 50);
         assert!(img.height() <= 50);
     }
 
     #[test]
-    fn render_svg_with_color_replacement() {
-        let result = render_svg_with_color(SIMPLE_SVG, 50, Some((0, 255, 0, 255)));
-        assert!(result.is_some());
+    fn render_invalid_svg_returns_error() {
+        let result = render_svg("not valid svg at all", 50);
+        assert!(result.is_err());
+    }
 
-        let img = result.unwrap();
+    #[test]
+    fn render_svg_with_color_replacement() {
+        let img = render_svg_with_color(SIMPLE_SVG, 50, Some((0, 255, 0, 255))).unwrap();
         // Check that the center pixel (inside the circle) is green-ish
         let center = img.get_pixel(img.width() / 2, img.height() / 2);
         assert!(center[1] > center[0], "Green should dominate after color replacement");
@@ -388,14 +454,14 @@ mod tests {
         let source = SvgSource::from_svg("<svg></svg>");
         assert!(source.is_raw());
         assert!(!source.is_emoji());
-        assert_eq!(source.resolve(), Some("<svg></svg>"));
+        assert_eq!(source.resolve().unwrap(), "<svg></svg>");
     }
 
     #[test]
     fn svg_source_into_from_string() {
         let source: SvgSource = "<svg></svg>".into();
         assert!(source.is_raw());
-        assert_eq!(source.resolve(), Some("<svg></svg>"));
+        assert_eq!(source.resolve().unwrap(), "<svg></svg>");
     }
 
     #[cfg(feature = "twemoji")]
@@ -411,20 +477,46 @@ mod tests {
 
     #[cfg(feature = "twemoji")]
     #[test]
-    fn svg_source_invalid_emoji_returns_none() {
-        // An invalid/unsupported string should return None
-        let source = SvgSource::from_emoji("not-an-emoji");
-        assert!(source.is_none());
+    fn svg_source_invalid_emoji_returns_error() {
+        // An invalid/unsupported string should return an error
+        let result = SvgSource::from_emoji("not-an-emoji");
+        assert!(result.is_err());
     }
 
     #[cfg(feature = "twemoji")]
     #[test]
     fn render_emoji_source() {
         let source = SvgSource::from_emoji("🦆").unwrap();
-        let img = render_source(&source, 64);
-        assert!(img.is_some(), "Should render emoji to image");
+        let img = render_source(&source, 64).expect("Should render emoji to image");
+        assert!(img.width() > 0);
+        assert!(img.height() > 0);
+    }
+
+    #[cfg(feature = "twemoji")]
+    #[test]
+    fn svg_source_from_emoji_name() {
+        let source = SvgSource::from_emoji_name("duck").expect("Duck emoji should be supported by name");
+        assert!(source.is_emoji_name());
+        assert!(!source.is_raw());
+        assert!(!source.is_emoji());
         
-        let img = img.unwrap();
+        let svg = source.resolve().expect("Should resolve to SVG");
+        assert!(svg.contains("<svg"), "Should be valid SVG data");
+    }
+
+    #[cfg(feature = "twemoji")]
+    #[test]
+    fn svg_source_invalid_emoji_name_returns_error() {
+        // An invalid/unsupported name should return an error
+        let result = SvgSource::from_emoji_name("not-a-valid-emoji-name");
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "twemoji")]
+    #[test]
+    fn render_emoji_name_source() {
+        let source = SvgSource::from_emoji_name("duck").unwrap();
+        let img = render_source(&source, 64).expect("Should render emoji by name to image");
         assert!(img.width() > 0);
         assert!(img.height() > 0);
     }

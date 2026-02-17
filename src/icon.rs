@@ -191,6 +191,58 @@ impl<'a> IntoIterator for &'a IconSet {
     }
 }
 
+/// The HSL color of an icon's primary content surface.
+///
+/// Used as the reference point when computing HSL mutation deltas.
+/// Each platform defines its own surface color (e.g., HSL(44°, 100%, 72%)
+/// for the golden-yellow Windows folder icon).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfaceColor {
+    /// Hue in degrees (0–360).
+    pub hue: f32,
+    /// Saturation as a fraction (0.0–1.0).
+    pub saturation: f32,
+    /// Lightness as a fraction (0.0–1.0).
+    pub lightness: f32,
+}
+
+impl SurfaceColor {
+    /// Creates a new surface color from HSL values.
+    ///
+    /// - `hue` is in degrees (0–360)
+    /// - `saturation` and `lightness` are fractions (0.0–1.0)
+    pub const fn new(hue: f32, saturation: f32, lightness: f32) -> Self {
+        Self {
+            hue,
+            saturation,
+            lightness,
+        }
+    }
+}
+
+/// A base icon set combined with metadata about the icon's appearance.
+///
+/// This is the primary input to [`IconCustomizer`](crate::IconCustomizer),
+/// pairing the icon images with the surface color needed to compute
+/// HSL mutation deltas from target colors.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IconBase {
+    /// The base icon images at various sizes.
+    pub icons: IconSet,
+    /// The HSL color of the icon's primary content surface.
+    pub surface_color: SurfaceColor,
+}
+
+impl IconBase {
+    /// Creates a new icon base with the given icons and surface color.
+    pub fn new(icons: IconSet, surface_color: SurfaceColor) -> Self {
+        Self {
+            icons,
+            surface_color,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

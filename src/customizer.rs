@@ -1,9 +1,10 @@
 //! Icon customization engine with layered transformations.
 
-use crate::icon::{IconImage, IconSet};
-use crate::layer::{DecalConfig, HueRotationConfig, LayerPipeline, SvgOverlayConfig};
+use crate::icon::{IconBase, IconImage, IconSet, SurfaceColor};
+use crate::layer::{DecalConfig, HslMutationConfig, LayerPipeline, SvgOverlayConfig};
+use crate::error::RenderError;
 use crate::profile::{
-    CustomizationProfile, DecalSettings, HueRotationSettings, OverlaySettings,
+    CustomizationProfile, DecalSettings, HslMutationSettings, OverlaySettings,
 };
 
 // ============================================================================
@@ -31,7 +32,7 @@ pub trait Configurable {
 ///
 /// # Layer Pipeline
 ///
-/// 1. **Hue Rotation** (`pipeline.hue`) - Shifts the hue of all pixels
+/// 1. **HSL Mutation** (`pipeline.hsl`) - Adjusts hue, saturation, and lightness
 /// 2. **Decal Imprint** (`pipeline.decal`) - Renders an SVG at the center
 /// 3. **SVG Overlay** (`pipeline.overlay`) - Renders an SVG at a corner position
 ///
@@ -43,17 +44,18 @@ pub trait Configurable {
 /// # Example
 ///
 /// ```
-/// use folco_renderer::{IconCustomizer, IconSet, HueRotationConfig, DecalConfig};
+/// use folco_renderer::{IconCustomizer, IconBase, IconSet, HslMutationConfig, DecalConfig, SurfaceColor};
 ///
-/// let base_icons = IconSet::new();
-/// let mut customizer = IconCustomizer::new(base_icons);
+/// let surface = SurfaceColor::new(44.0, 1.0, 0.72);
+/// let base = IconBase::new(IconSet::new(), surface);
+/// let mut customizer = IconCustomizer::new(base);
 ///
 /// // Configure layers directly
-/// customizer.pipeline.hue.set_config(Some(HueRotationConfig::new(180.0)));
+/// customizer.pipeline.hsl.set_config(Some(HslMutationConfig::new(&surface, 200.0, 0.8, 0.5)));
 /// customizer.pipeline.decal.set_config(Some(DecalConfig::new("<svg>...</svg>", 0.5)));
 ///
 /// // Toggle layers without losing config
-/// customizer.pipeline.hue.set_enabled(false);
+/// customizer.pipeline.hsl.set_enabled(false);
 ///
 /// // Render
 /// let output = customizer.render_all();
@@ -62,6 +64,11 @@ pub struct IconCustomizer {
     /// The original system folder icon set (never modified).
     base_icons: IconSet,
 
+    /// The HSL color of the icon's content surface.
+    ///
+    /// Used to compute deltas when applying a profile with target HSL colors.
+    surface_color: SurfaceColor,
+
     /// The layer pipeline. Access layers directly to configure them.
     ///
     /// See [`LayerPipeline`] for the dependency graph and available layers.
@@ -69,10 +76,11 @@ pub struct IconCustomizer {
 }
 
 impl IconCustomizer {
-    /// Creates a new customizer with the given base icon set.
-    pub fn new(base_icons: IconSet) -> Self {
+    /// Creates a new customizer with the given base icon set and surface color.
+    pub fn new(base: IconBase) -> Self {
         Self {
-            base_icons,
+            base_icons: base.icons,
+            surface_color: base.surface_color,
             pipeline: LayerPipeline::default(),
         }
     }
@@ -82,26 +90,43 @@ impl IconCustomizer {
         &self.base_icons
     }
 
+    /// Returns the surface color used for HSL target→delta computation.
+    pub fn surface_color(&self) -> &SurfaceColor {
+        &self.surface_color
+    }
+
     /// Renders a single icon at the specified logical size.
     ///
     /// Returns the closest matching size from the base icon set,
-    /// with all enabled customizations applied. Returns `None` if
-    /// the base icon set is empty.
-    pub fn render(&mut self, logical_size: u32) -> Option<IconImage> {
-        let base = self.base_icons.find_by_logical_size(logical_size)?.clone();
-        Some(self.pipeline.render(&base))
+    /// with all enabled customizations applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::NoBaseIcon`] if no base icon matches the size,
+    /// or a render error if a layer fails (e.g., invalid SVG or emoji).
+    pub fn render(&mut self, logical_size: u32) -> Result<IconImage, RenderError> {
+        let base = self
+            .base_icons
+            .find_by_logical_size(logical_size)
+            .ok_or(RenderError::NoBaseIcon { logical_size })?
+            .clone();
+        self.pipeline.render(&base, &self.surface_color)
     }
 
     /// Renders all sizes in the base icon set with customizations applied.
     ///
     /// Returns a new `IconSet` containing the rendered images.
-    pub fn render_all(&mut self) -> IconSet {
+    ///
+    /// # Errors
+    ///
+    /// Returns a render error if any layer fails.
+    pub fn render_all(&mut self) -> Result<IconSet, RenderError> {
         let base_images: Vec<_> = self.base_icons.iter().cloned().collect();
-        let rendered: Vec<_> = base_images
-            .iter()
-            .map(|base| self.pipeline.render(base))
-            .collect();
-        IconSet::from_images(rendered)
+        let mut rendered = Vec::with_capacity(base_images.len());
+        for base in &base_images {
+            rendered.push(self.pipeline.render(base, &self.surface_color)?);
+        }
+        Ok(IconSet::from_images(rendered))
     }
 
     /// Clears all layer caches. Useful for freeing memory.
@@ -113,28 +138,37 @@ impl IconCustomizer {
 impl Configurable for IconCustomizer {
     /// Applies a profile's settings to this customizer.
     ///
-    /// This sets the configuration and enabled state for each layer.
+    /// HSL mutation settings are expressed as target colors; the customizer
+    /// computes the necessary deltas from the stored surface color.
     ///
     /// # Example
     ///
     /// ```
-    /// use folco_renderer::{IconCustomizer, IconSet, Configurable, CustomizationProfile, HueRotationSettings};
+    /// use folco_renderer::{IconCustomizer, IconBase, IconSet, SurfaceColor, Configurable, CustomizationProfile, HslMutationSettings};
     ///
-    /// let mut customizer = IconCustomizer::new(IconSet::new());
+    /// let surface = SurfaceColor::new(44.0, 1.0, 0.72);
+    /// let mut customizer = IconCustomizer::new(IconBase::new(IconSet::new(), surface));
     /// let profile = CustomizationProfile::new()
-    ///     .with_hue_rotation(HueRotationSettings { degrees: 90.0, enabled: true });
+    ///     .with_hsl_mutation(HslMutationSettings {
+    ///         target_hue: 200.0, target_saturation: 0.8, target_lightness: 0.5, enabled: true,
+    ///     });
     ///
     /// customizer.apply_profile(&profile);
     /// ```
     fn apply_profile(&mut self, profile: &CustomizationProfile) {
-        // Hue rotation
-        if let Some(ref settings) = profile.hue_rotation {
+        // HSL mutation — convert target color to deltas via surface color
+        if let Some(ref settings) = profile.hsl_mutation {
             self.pipeline
-                .hue
-                .set_config(Some(HueRotationConfig::new(settings.degrees)));
-            self.pipeline.hue.set_enabled(settings.enabled);
+                .hsl
+                .set_config(Some(HslMutationConfig::new(
+                    &self.surface_color,
+                    settings.target_hue,
+                    settings.target_saturation,
+                    settings.target_lightness,
+                )));
+            self.pipeline.hsl.set_enabled(settings.enabled);
         } else {
-            self.pipeline.hue.set_config(None);
+            self.pipeline.hsl.set_config(None);
         }
 
         // Decal
@@ -164,21 +198,27 @@ impl Configurable for IconCustomizer {
 
     /// Exports the current customization settings as a profile.
     ///
+    /// HSL mutation settings are exported as target colors, reverse-computed
+    /// from the internal deltas and the stored surface color.
+    ///
     /// # Example
     ///
     /// ```
-    /// use folco_renderer::{IconCustomizer, IconSet, Configurable, HueRotationConfig};
+    /// use folco_renderer::{IconCustomizer, IconBase, IconSet, SurfaceColor, Configurable, HslMutationConfig};
     ///
-    /// let mut customizer = IconCustomizer::new(IconSet::new());
-    /// customizer.pipeline.hue.set_config(Some(HueRotationConfig::new(45.0)));
+    /// let surface = SurfaceColor::new(44.0, 1.0, 0.72);
+    /// let mut customizer = IconCustomizer::new(IconBase::new(IconSet::new(), surface));
+    /// customizer.pipeline.hsl.set_config(Some(HslMutationConfig::new(&surface, 200.0, 0.8, 0.5)));
     ///
     /// let profile = customizer.export_profile();
     /// let json = profile.to_json().unwrap();
     /// ```
     fn export_profile(&self) -> CustomizationProfile {
-        let hue_rotation = self.pipeline.hue.config().map(|c| HueRotationSettings {
-            degrees: c.degrees,
-            enabled: self.pipeline.hue.is_enabled(),
+        let hsl_mutation = self.pipeline.hsl.config().map(|c| HslMutationSettings {
+            target_hue: c.target_hue,
+            target_saturation: c.target_saturation,
+            target_lightness: c.target_lightness,
+            enabled: self.pipeline.hsl.is_enabled(),
         });
 
         let decal = self.pipeline.decal.config().map(|c| DecalSettings {
@@ -195,7 +235,7 @@ impl Configurable for IconCustomizer {
         });
 
         CustomizationProfile {
-            hue_rotation,
+            hsl_mutation,
             decal,
             overlay,
         }
@@ -210,10 +250,15 @@ impl Configurable for IconCustomizer {
 mod tests {
     use super::*;
     use crate::layer::decal::darken_color;
-    use crate::layer::{DecalConfig, HueRotationConfig, Layer, OverlayPosition, SvgOverlayConfig};
+    use crate::layer::{DecalConfig, HslMutationConfig, Layer, OverlayPosition, SvgOverlayConfig};
     use image::RgbaImage;
 
-    fn create_test_icon_set() -> IconSet {
+    const TEST_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" fill="red"/></svg>"##;
+
+    /// Test surface color — uses the same golden-yellow as Windows folders.
+    const TEST_SURFACE: SurfaceColor = SurfaceColor::new(44.0, 1.0, 0.72);
+
+    fn create_test_icon_base() -> IconBase {
         let mut set = IconSet::new();
 
         // Create a 16x16 red icon
@@ -230,45 +275,47 @@ mod tests {
         }
         set.add_image(IconImage::new_full_content(img32, 1.0));
 
-        set
+        IconBase::new(set, TEST_SURFACE)
     }
 
     #[test]
     fn customizer_creation() {
-        let icons = create_test_icon_set();
-        let customizer = IconCustomizer::new(icons);
+        let base = create_test_icon_base();
+        let customizer = IconCustomizer::new(base);
 
-        assert!(customizer.pipeline.hue.config().is_none());
+        assert!(customizer.pipeline.hsl.config().is_none());
         assert!(customizer.pipeline.decal.config().is_none());
         assert!(customizer.pipeline.overlay.config().is_none());
     }
 
     #[test]
-    fn hue_rotation_setting() {
-        let icons = create_test_icon_set();
-        let mut customizer = IconCustomizer::new(icons);
+    fn hsl_mutation_setting() {
+        let base = create_test_icon_base();
+        let mut customizer = IconCustomizer::new(base);
 
         customizer
             .pipeline
-            .hue
-            .set_config(Some(HueRotationConfig::new(180.0)));
-        assert_eq!(customizer.pipeline.hue.config().unwrap().degrees, 180.0);
+            .hsl
+            .set_config(Some(HslMutationConfig::new(&TEST_SURFACE, 224.0, 0.8, 0.504)));
+        assert!((customizer.pipeline.hsl.config().unwrap().target_hue - 224.0).abs() < 0.01);
+        assert!((customizer.pipeline.hsl.config().unwrap().target_saturation - 0.8).abs() < 0.01);
+        assert!((customizer.pipeline.hsl.config().unwrap().target_lightness - 0.504).abs() < 0.01);
 
-        // Test normalization
+        // Test normalization (450° wraps to 90°)
         customizer
             .pipeline
-            .hue
-            .set_config(Some(HueRotationConfig::new(450.0)));
-        assert_eq!(customizer.pipeline.hue.config().unwrap().degrees, 90.0);
+            .hsl
+            .set_config(Some(HslMutationConfig::new(&TEST_SURFACE, 450.0, 1.0, 0.72)));
+        assert!((customizer.pipeline.hsl.config().unwrap().target_hue - 90.0).abs() < 0.01);
 
-        customizer.pipeline.hue.set_config(None);
-        assert!(customizer.pipeline.hue.config().is_none());
+        customizer.pipeline.hsl.set_config(None);
+        assert!(customizer.pipeline.hsl.config().is_none());
     }
 
     #[test]
     fn render_without_customizations() {
-        let icons = create_test_icon_set();
-        let mut customizer = IconCustomizer::new(icons);
+        let base = create_test_icon_base();
+        let mut customizer = IconCustomizer::new(base);
 
         let rendered = customizer.render(16).unwrap();
         assert_eq!(rendered.dimensions().width, 16);
@@ -280,23 +327,23 @@ mod tests {
 
     #[test]
     fn render_all_sizes() {
-        let icons = create_test_icon_set();
-        let mut customizer = IconCustomizer::new(icons);
+        let base = create_test_icon_base();
+        let mut customizer = IconCustomizer::new(base);
 
-        let result = customizer.render_all();
+        let result = customizer.render_all().unwrap();
         assert_eq!(result.len(), 2);
     }
 
     #[test]
-    fn hue_rotation_applied() {
-        let icons = create_test_icon_set();
-        let mut customizer = IconCustomizer::new(icons);
+    fn hsl_mutation_applied() {
+        let base = create_test_icon_base();
+        let mut customizer = IconCustomizer::new(base);
 
         // Rotate red (hue 0) by 120° -> should become greenish
         customizer
             .pipeline
-            .hue
-            .set_config(Some(HueRotationConfig::new(120.0)));
+            .hsl
+            .set_config(Some(HslMutationConfig::new(&TEST_SURFACE, 164.0, 1.0, 0.72)));
 
         let rendered = customizer.render(16).unwrap();
         let pixel = rendered.data.get_pixel(0, 0);
@@ -304,31 +351,31 @@ mod tests {
         // Green channel should be dominant after rotation
         assert!(
             pixel[1] > pixel[0],
-            "Green should be > Red after 120° rotation"
+            "Green should be > Red after 120° hue shift"
         );
         assert!(
             pixel[1] > pixel[2],
-            "Green should be > Blue after 120° rotation"
+            "Green should be > Blue after 120° hue shift"
         );
     }
 
     #[test]
-    fn cache_invalidation_on_hue_change() {
-        let icons = create_test_icon_set();
-        let mut customizer = IconCustomizer::new(icons);
+    fn cache_invalidation_on_hsl_change() {
+        let base = create_test_icon_base();
+        let mut customizer = IconCustomizer::new(base);
 
         // First render
         customizer
             .pipeline
-            .hue
-            .set_config(Some(HueRotationConfig::new(60.0)));
+            .hsl
+            .set_config(Some(HslMutationConfig::new(&TEST_SURFACE, 104.0, 1.0, 0.72)));
         let first = customizer.render(16).unwrap();
 
         // Change hue and render again
         customizer
             .pipeline
-            .hue
-            .set_config(Some(HueRotationConfig::new(180.0)));
+            .hsl
+            .set_config(Some(HslMutationConfig::new(&TEST_SURFACE, 224.0, 1.0, 0.72)));
         let second = customizer.render(16).unwrap();
 
         // Results should be different
@@ -336,19 +383,19 @@ mod tests {
         let p2 = second.data.get_pixel(0, 0);
         assert_ne!(
             p1.0, p2.0,
-            "Different hue rotations should produce different results"
+            "Different hue shifts should produce different results"
         );
     }
 
     #[test]
     fn cache_reuse_same_config() {
-        let icons = create_test_icon_set();
-        let mut customizer = IconCustomizer::new(icons);
+        let base = create_test_icon_base();
+        let mut customizer = IconCustomizer::new(base);
 
         customizer
             .pipeline
-            .hue
-            .set_config(Some(HueRotationConfig::new(90.0)));
+            .hsl
+            .set_config(Some(HslMutationConfig::new(&TEST_SURFACE, 134.0, 1.0, 0.72)));
 
         // Render twice with same config
         let first = customizer.render(16).unwrap();
@@ -412,29 +459,29 @@ mod tests {
     }
 
     #[test]
-    fn hue_rotation_toggle() {
-        let icons = create_test_icon_set();
-        let mut customizer = IconCustomizer::new(icons);
+    fn hsl_mutation_toggle() {
+        let base = create_test_icon_base();
+        let mut customizer = IconCustomizer::new(base);
 
-        // Set hue rotation
+        // Set HSL mutation
         customizer
             .pipeline
-            .hue
-            .set_config(Some(HueRotationConfig::new(120.0)));
-        assert!(customizer.pipeline.hue.is_enabled());
+            .hsl
+            .set_config(Some(HslMutationConfig::new(&TEST_SURFACE, 164.0, 1.0, 0.72)));
+        assert!(customizer.pipeline.hsl.is_enabled());
         let rotated = customizer.render(16).unwrap();
         let rotated_pixel = rotated.data.get_pixel(0, 0).0;
 
         // Disable - should render as original
-        customizer.pipeline.hue.set_enabled(false);
-        assert!(!customizer.pipeline.hue.is_enabled());
+        customizer.pipeline.hsl.set_enabled(false);
+        assert!(!customizer.pipeline.hsl.is_enabled());
         // Config preserved!
-        assert_eq!(customizer.pipeline.hue.config().unwrap().degrees, 120.0);
+        assert!((customizer.pipeline.hsl.config().unwrap().target_hue - 164.0).abs() < 0.01);
         let disabled = customizer.render(16).unwrap();
         assert_eq!(disabled.data.get_pixel(0, 0).0, [255, 0, 0, 255]); // Original red
 
         // Re-enable - should render rotated again
-        customizer.pipeline.hue.set_enabled(true);
+        customizer.pipeline.hsl.set_enabled(true);
         let re_enabled = customizer.render(16).unwrap();
         assert_eq!(re_enabled.data.get_pixel(0, 0).0, rotated_pixel);
     }
@@ -475,8 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn decal_uses_hue_rotated_dominant_color() {
-        use crate::layer::hue_rotation::sample_dominant_color;
+    fn decal_uses_hsl_mutated_dominant_color() {
         use crate::layer::{DominantColor, LayerEffect, RenderContext};
 
         // Create a solid red image
@@ -486,33 +532,30 @@ mod tests {
         }
         let red_icon = IconImage::new_full_content(red_img, 1.0);
 
-        // Sample dominant color from red base (for comparison)
-        let base_color = sample_dominant_color(&red_icon);
-        assert_eq!(base_color, (255, 0, 0, 255), "Base should be red");
-
-        // Apply hue rotation (120° rotates red -> green)
-        let hue_config = HueRotationConfig::new(120.0);
+        // Apply hue shift (120° rotates red -> green)
+        let hsl_config = HslMutationConfig::new(&TEST_SURFACE, 164.0, 1.0, 0.72);
         let mut ctx = RenderContext::new(red_icon.clone());
-        hue_config.transform(&mut ctx);
-        hue_config.emit(&mut ctx);
+        ctx.set(TEST_SURFACE);
+        hsl_config.transform(&mut ctx).unwrap();
+        hsl_config.emit(&mut ctx);
 
-        // Verify hue rotation emitted DominantColor
+        // Verify HSL mutation emitted DominantColor
         let emitted = ctx.get::<DominantColor>();
-        assert!(emitted.is_some(), "Hue rotation should emit DominantColor");
+        assert!(emitted.is_some(), "HSL mutation should emit DominantColor");
 
         let emitted_color = emitted.unwrap().as_tuple();
-        // After 120° rotation, red should become green-ish
+        // After 120° hue shift, red should become green-ish
         assert!(
             emitted_color.1 > emitted_color.0,
-            "Emitted color should have more green than red after 120° rotation"
+            "Emitted color should have more green than red after 120° hue shift"
         );
 
         // Now apply decal - it should use the emitted color, not re-sample
-        let decal_config = DecalConfig::new("<svg></svg>", 0.5);
-        decal_config.transform(&mut ctx);
+        let decal_config = DecalConfig::new(TEST_SVG, 0.5);
+        decal_config.transform(&mut ctx).unwrap();
         // Decal doesn't emit, so no emit() call needed
 
-        // The DominantColor property should still be the rotated green
+        // The DominantColor property should still be the shifted green
         // (Decal consumes but doesn't overwrite)
         let color_after_decal = ctx.get::<DominantColor>().unwrap().as_tuple();
         assert_eq!(
@@ -522,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    fn decal_samples_base_when_hue_disabled() {
+    fn decal_samples_base_when_hsl_disabled() {
         use crate::layer::{CacheKey, DominantColor, LayerVersions, RenderContext};
 
         // Create a solid blue image
@@ -532,43 +575,44 @@ mod tests {
         }
         let blue_icon = IconImage::new_full_content(blue_img, 1.0);
 
-        // Set up layers: hue has config but is DISABLED
-        let mut hue_layer: Layer<HueRotationConfig> = Layer::default();
-        hue_layer.set_config(Some(HueRotationConfig::new(120.0)));
-        hue_layer.set_enabled(false); // Disabled!
+        // Set up layers: HSL has config but is DISABLED
+        let mut hsl_layer: Layer<HslMutationConfig> = Layer::default();
+        hsl_layer.set_config(Some(HslMutationConfig::new(&TEST_SURFACE, 164.0, 1.0, 0.72)));
+        hsl_layer.set_enabled(false); // Disabled!
 
         let mut decal_layer: Layer<DecalConfig> = Layer::default();
-        decal_layer.set_config(Some(DecalConfig::new("<svg></svg>", 0.5)));
+        decal_layer.set_config(Some(DecalConfig::new(TEST_SVG, 0.5)));
 
         // Create context and apply through Layer::apply (not LayerEffect::apply)
         let mut ctx = RenderContext::new(blue_icon.clone());
+        ctx.set(TEST_SURFACE);
         let key = CacheKey::from_icon(&blue_icon);
         let versions = LayerVersions {
-            hue: hue_layer.version(),
+            hsl: hsl_layer.version(),
             decal: decal_layer.version(),
             overlay: 0,
         };
 
-        // Apply hue layer (should skip because disabled)
-        hue_layer.apply(&mut ctx, key, &versions);
+        // Apply HSL layer (should skip because disabled)
+        hsl_layer.apply(&mut ctx, key, &versions).unwrap();
 
-        // Verify no DominantColor was emitted (because hue was skipped)
+        // Verify no DominantColor was emitted (because HSL was skipped)
         assert!(
             ctx.get::<DominantColor>().is_none(),
-            "No DominantColor should exist when hue layer is disabled"
+            "No DominantColor should exist when HSL layer is disabled"
         );
 
         // Image should be unchanged (still blue)
         assert_eq!(
             ctx.image.data.get_pixel(0, 0).0,
             [0, 0, 255, 255],
-            "Image should be unchanged when hue is disabled"
+            "Image should be unchanged when HSL is disabled"
         );
 
-        // Apply decal - it should fall back to sampling ctx.image (the base blue)
-        decal_layer.apply(&mut ctx, key, &versions);
+        // Apply decal - it should fall back to surface color (the golden-yellow)
+        decal_layer.apply(&mut ctx, key, &versions).unwrap();
 
-        // Image still blue (decal is rendered but our test SVG is tiny/empty)
+        // Image still blue at corner (decal renders at center, not at (0,0))
         assert_eq!(
             ctx.image.data.get_pixel(0, 0).0,
             [0, 0, 255, 255],
@@ -577,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_hue_layer_version_change_invalidates_decal_cache() {
+    fn disabled_hsl_layer_version_change_invalidates_decal_cache() {
         use crate::layer::{CacheKey, DominantColor, LayerVersions, RenderContext};
 
         // Create red and blue test icons
@@ -589,64 +633,66 @@ mod tests {
         let key = CacheKey::from_icon(&red_icon);
 
         // Set up layers
-        let mut hue_layer: Layer<HueRotationConfig> = Layer::default();
-        hue_layer.set_config(Some(HueRotationConfig::new(120.0)));
+        let mut hsl_layer: Layer<HslMutationConfig> = Layer::default();
+        hsl_layer.set_config(Some(HslMutationConfig::new(&TEST_SURFACE, 164.0, 1.0, 0.72)));
         let mut decal_layer: Layer<DecalConfig> = Layer::default();
-        decal_layer.set_config(Some(DecalConfig::new("<svg></svg>", 0.5)));
+        decal_layer.set_config(Some(DecalConfig::new(TEST_SVG, 0.5)));
 
-        // First render: hue enabled
+        // First render: HSL enabled
         let versions_v1 = LayerVersions {
-            hue: hue_layer.version(),
+            hsl: hsl_layer.version(),
             decal: decal_layer.version(),
             overlay: 0,
         };
         let mut ctx1 = RenderContext::new(red_icon.clone());
-        hue_layer.apply(&mut ctx1, key, &versions_v1);
-        decal_layer.apply(&mut ctx1, key, &versions_v1);
+        ctx1.set(TEST_SURFACE);
+        hsl_layer.apply(&mut ctx1, key, &versions_v1).unwrap();
+        decal_layer.apply(&mut ctx1, key, &versions_v1).unwrap();
 
-        // Hue should have emitted DominantColor (green-ish after 120° rotation)
-        let emitted_with_hue = ctx1.get::<DominantColor>().unwrap().as_tuple();
+        // HSL should have emitted DominantColor (green-ish after 120° shift)
+        let emitted_with_hsl = ctx1.get::<DominantColor>().unwrap().as_tuple();
         assert!(
-            emitted_with_hue.1 > emitted_with_hue.0,
-            "With hue enabled, emitted color should be green-ish"
+            emitted_with_hsl.1 > emitted_with_hsl.0,
+            "With HSL enabled, emitted color should be green-ish"
         );
 
-        // Now disable hue - version should change
-        let old_version = hue_layer.version();
-        hue_layer.set_enabled(false);
-        let new_version = hue_layer.version();
+        // Now disable HSL - version should change
+        let old_version = hsl_layer.version();
+        hsl_layer.set_enabled(false);
+        let new_version = hsl_layer.version();
         assert_ne!(
             old_version, new_version,
             "Disabling layer should change its version"
         );
 
-        // Second render: hue disabled
+        // Second render: HSL disabled
         let versions_v2 = LayerVersions {
-            hue: hue_layer.version(), // New version!
+            hsl: hsl_layer.version(), // New version!
             decal: decal_layer.version(),
             overlay: 0,
         };
         let mut ctx2 = RenderContext::new(red_icon.clone());
-        hue_layer.apply(&mut ctx2, key, &versions_v2);
-        decal_layer.apply(&mut ctx2, key, &versions_v2);
+        ctx2.set(TEST_SURFACE);
+        hsl_layer.apply(&mut ctx2, key, &versions_v2).unwrap();
+        decal_layer.apply(&mut ctx2, key, &versions_v2).unwrap();
 
-        // No DominantColor should be emitted (hue was skipped)
+        // No DominantColor should be emitted (HSL was skipped)
         assert!(
             ctx2.get::<DominantColor>().is_none(),
-            "With hue disabled, no DominantColor should be emitted"
+            "With HSL disabled, no DominantColor should be emitted"
         );
 
-        // Image should be original red (not rotated)
+        // Image should be original red (not shifted)
         assert_eq!(
             ctx2.image.data.get_pixel(0, 0).0,
             [255, 0, 0, 255],
-            "With hue disabled, image should be original red"
+            "With HSL disabled, image should be original red"
         );
     }
 
     #[test]
-    fn pipeline_property_flow_with_hue_toggle() {
-        // Integration test: verify the full pipeline handles hue toggle correctly
+    fn pipeline_property_flow_with_hsl_toggle() {
+        // Integration test: verify the full pipeline handles HSL toggle correctly
         let mut red_img = RgbaImage::new(16, 16);
         for pixel in red_img.pixels_mut() {
             pixel.0 = [255, 0, 0, 255];
@@ -654,48 +700,47 @@ mod tests {
         let mut icons = IconSet::new();
         icons.add_image(IconImage::new_full_content(red_img, 1.0));
 
-        let mut customizer = IconCustomizer::new(icons);
+        let mut customizer = IconCustomizer::new(IconBase::new(icons, TEST_SURFACE));
 
-        // Enable both hue rotation and decal
+        // Enable both HSL mutation and decal
         customizer
             .pipeline
-            .hue
-            .set_config(Some(HueRotationConfig::new(120.0)));
+            .hsl
+            .set_config(Some(HslMutationConfig::new(&TEST_SURFACE, 164.0, 1.0, 0.72)));
         customizer
             .pipeline
             .decal
-            .set_config(Some(DecalConfig::new("<svg></svg>", 0.5)));
+            .set_config(Some(DecalConfig::new(TEST_SVG, 0.5)));
 
-        // Render with hue enabled
-        let with_hue = customizer.render(16).unwrap();
-        let hue_pixel = with_hue.data.get_pixel(0, 0).0;
+        // Render with HSL enabled
+        let with_hsl = customizer.render(16).unwrap();
+        let hsl_pixel = with_hsl.data.get_pixel(0, 0).0;
 
-        // Disable hue but keep decal
-        customizer.pipeline.hue.set_enabled(false);
-        let without_hue = customizer.render(16).unwrap();
-        let no_hue_pixel = without_hue.data.get_pixel(0, 0).0;
+        // Disable HSL but keep decal
+        customizer.pipeline.hsl.set_enabled(false);
+        let without_hsl = customizer.render(16).unwrap();
+        let no_hsl_pixel = without_hsl.data.get_pixel(0, 0).0;
 
-        // With hue: image should be rotated (more green than red)
+        // With HSL: image should be shifted (more green than red)
         assert!(
-            hue_pixel[1] > hue_pixel[0],
-            "With hue enabled, green should dominate"
+            hsl_pixel[1] > hsl_pixel[0],
+            "With HSL enabled, green should dominate"
         );
 
-        // Without hue: image should be original red
-        // (decal is rendered but doesn't affect the corner pixel we're testing)
+        // Without HSL: image should be original red
         assert_eq!(
-            no_hue_pixel,
+            no_hsl_pixel,
             [255, 0, 0, 255],
-            "With hue disabled, should be original red"
+            "With HSL disabled, should be original red"
         );
 
-        // Re-enable hue - should go back to rotated
-        customizer.pipeline.hue.set_enabled(true);
+        // Re-enable HSL - should go back to shifted
+        customizer.pipeline.hsl.set_enabled(true);
         let re_enabled = customizer.render(16).unwrap();
         assert_eq!(
             re_enabled.data.get_pixel(0, 0).0,
-            hue_pixel,
-            "Re-enabling hue should restore rotated result"
+            hsl_pixel,
+            "Re-enabling HSL should restore shifted result"
         );
     }
 }

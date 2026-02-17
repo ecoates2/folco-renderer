@@ -15,16 +15,17 @@
 //! layers to communicate without tight coupling.
 
 pub mod decal;
-pub mod hue_rotation;
+pub mod hsl_mutation;
 pub mod overlay;
 pub mod svg;
 
 pub use decal::DecalConfig;
-pub use hue_rotation::HueRotationConfig;
+pub use hsl_mutation::HslMutationConfig;
 pub use overlay::{OverlayPosition, SvgOverlayConfig};
 pub use svg::SvgSource;
 
-use crate::icon::IconImage;
+use crate::error::RenderError;
+use crate::icon::{IconImage, SurfaceColor};
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 
@@ -89,7 +90,7 @@ impl RenderContext {
 
 /// The dominant color sampled from the image.
 ///
-/// Emitted by layers that modify the image appearance (like hue rotation).
+/// Emitted by layers that modify the image appearance (like HSL mutation).
 /// Consumed by layers that need to derive colors from the image (like decal).
 #[derive(Debug, Clone, Copy)]
 pub struct DominantColor {
@@ -148,7 +149,12 @@ pub trait LayerEffect: LayerConfig {
     /// 2. Modify `ctx.image` as needed
     ///
     /// Property emission happens in [`emit`](Self::emit), not here.
-    fn transform(&self, ctx: &mut RenderContext);
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the layer fails to render (e.g., SVG parse
+    /// failure or invalid emoji source).
+    fn transform(&self, ctx: &mut RenderContext) -> Result<(), RenderError>;
 
     /// Emit properties for downstream layers to consume.
     ///
@@ -202,8 +208,8 @@ impl DependencyVersion {
 /// which upstream layers it depends on for cache invalidation.
 #[derive(Debug, Clone, Copy)]
 pub struct LayerVersions {
-    /// Version of the hue rotation layer.
-    pub hue: u64,
+    /// Version of the HSL mutation layer.
+    pub hsl: u64,
     /// Version of the decal layer.
     pub decal: u64,
     /// Version of the overlay layer.
@@ -361,9 +367,13 @@ impl<C: LayerEffect> Layer<C> {
     /// If the layer is not active, it does nothing (context passes through unchanged).
     /// If a valid cached result exists, it updates the context image from cache.
     /// Otherwise, it calls transform() then emit() and caches the result.
-    pub fn apply(&mut self, ctx: &mut RenderContext, key: CacheKey, versions: &LayerVersions) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `transform()` fails.
+    pub fn apply(&mut self, ctx: &mut RenderContext, key: CacheKey, versions: &LayerVersions) -> Result<(), RenderError> {
         if !self.is_active() {
-            return;
+            return Ok(());
         }
 
         // Compute dependencies from the trait
@@ -374,16 +384,17 @@ impl<C: LayerEffect> Layer<C> {
             ctx.image = cached.clone();
             // Re-emit properties (they aren't cached, only the image is)
             self.config().unwrap().emit(ctx);
-            return;
+            return Ok(());
         }
 
         // Apply the layer: transform then emit
         let config = self.config().unwrap();
-        config.transform(ctx);
+        config.transform(ctx)?;
         config.emit(ctx);
 
         // Cache the result (image only, properties are re-emitted on cache hit)
         self.store(key, ctx.image.clone(), deps);
+        Ok(())
     }
 }
 
@@ -455,12 +466,12 @@ impl CompositeLayer {
 ///     │
 ///     ▼
 /// ┌─────────┐
-/// │   Hue   │ ◄── No dependencies (root layer)
+/// │   HSL   │ ◄── No dependencies (root layer)
 /// └────┬────┘
 ///      │
 ///      ▼
 /// ┌─────────┐
-/// │  Decal  │ ◄── Depends on: Hue
+/// │  Decal  │ ◄── Depends on: HSL
 /// └────┬────┘
 ///      │
 ///      ▼
@@ -470,14 +481,14 @@ impl CompositeLayer {
 ///      │
 ///      ▼
 /// ┌─────────────┐
-/// │  Composite  │ ◄── Depends on: Hue + Decal + Overlay
+/// │  Composite  │ ◄── Depends on: HSL + Decal + Overlay
 /// └─────────────┘
 /// ```
 pub struct LayerPipeline {
-    /// Hue rotation layer (root - no dependencies).
-    pub hue: Layer<HueRotationConfig>,
+    /// HSL mutation layer (root - no dependencies).
+    pub hsl: Layer<HslMutationConfig>,
 
-    /// Decal imprint layer (depends on hue).
+    /// Decal imprint layer (depends on HSL).
     pub decal: Layer<DecalConfig>,
 
     /// SVG overlay layer (no dependencies, applied last).
@@ -490,7 +501,7 @@ pub struct LayerPipeline {
 impl Default for LayerPipeline {
     fn default() -> Self {
         Self {
-            hue: Layer::default(),
+            hsl: Layer::default(),
             decal: Layer::default(),
             overlay: Layer::default(),
             composite: CompositeLayer::default(),
@@ -504,7 +515,7 @@ impl LayerPipeline {
     /// Used by [`LayerEffect::dependencies`] to compute cache invalidation.
     pub fn layer_versions(&self) -> LayerVersions {
         LayerVersions {
-            hue: self.hue.version(),
+            hsl: self.hsl.version(),
             decal: self.decal.version(),
             overlay: self.overlay.version(),
         }
@@ -512,7 +523,7 @@ impl LayerPipeline {
 
     /// Invalidates all caches.
     pub fn invalidate_all(&mut self) {
-        self.hue.invalidate();
+        self.hsl.invalidate();
         self.decal.invalidate();
         self.overlay.invalidate();
         self.composite.invalidate();
@@ -521,7 +532,7 @@ impl LayerPipeline {
     /// Returns the combined dependency version for the composite layer.
     fn composite_dependencies(&self) -> DependencyVersion {
         DependencyVersion::combine(&[
-            self.hue.version(),
+            self.hsl.version(),
             self.decal.version(),
             self.overlay.version(),
         ])
@@ -531,30 +542,35 @@ impl LayerPipeline {
     ///
     /// This is the main entry point for rendering. It:
     /// 1. Checks the composite cache first
-    /// 2. Creates a render context with the base image
+    /// 2. Creates a render context with the base image and surface color
     /// 3. Applies each layer in order, passing the context through
     /// 4. Caches and returns the final result
-    pub fn render(&mut self, base: &IconImage) -> IconImage {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any layer fails to render.
+    pub fn render(&mut self, base: &IconImage, surface_color: &SurfaceColor) -> Result<IconImage, RenderError> {
         let key = CacheKey::from_icon(base);
         let composite_deps = self.composite_dependencies();
 
         // Check composite cache first
         if let Some(cached) = self.composite.get_cached(key, composite_deps) {
-            return cached.clone();
+            return Ok(cached.clone());
         }
 
-        // Create render context
+        // Create render context with surface color available for layers
         let mut ctx = RenderContext::new(base.clone());
+        ctx.set(*surface_color);
 
         // Apply layers in order (each layer computes its own dependencies)
         let versions = self.layer_versions();
-        self.hue.apply(&mut ctx, key, &versions);
-        self.decal.apply(&mut ctx, key, &versions);
-        self.overlay.apply(&mut ctx, key, &versions);
+        self.hsl.apply(&mut ctx, key, &versions)?;
+        self.decal.apply(&mut ctx, key, &versions)?;
+        self.overlay.apply(&mut ctx, key, &versions)?;
 
         // Cache the final result
         self.composite.store(key, ctx.image.clone(), composite_deps);
 
-        ctx.image
+        Ok(ctx.image)
     }
 }

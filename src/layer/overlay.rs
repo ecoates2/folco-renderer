@@ -2,6 +2,7 @@
 
 use super::svg::{composite_over, render_source, SvgSource};
 use super::{DependencyVersion, LayerConfig, LayerEffect, LayerVersions, RenderContext};
+use crate::error::RenderError;
 use crate::icon::IconImage;
 
 // ============================================================================
@@ -62,12 +63,25 @@ impl SvgOverlayConfig {
 
     /// Creates a new overlay config from an emoji.
     ///
-    /// Returns `None` if the emoji is not supported by twemoji_assets.
+    /// Returns an error if the emoji is not supported by twemoji_assets.
     /// Only available when the `twemoji` feature is enabled.
     #[cfg(feature = "twemoji")]
-    pub fn from_emoji(emoji: &str, position: OverlayPosition, scale: f32) -> Option<Self> {
-        Some(Self {
+    pub fn from_emoji(emoji: &str, position: OverlayPosition, scale: f32) -> Result<Self, RenderError> {
+        Ok(Self {
             source: SvgSource::from_emoji(emoji)?,
+            position,
+            scale: scale.clamp(0.0, 1.0),
+        })
+    }
+
+    /// Creates a new overlay config from an emoji name (e.g., "duck").
+    ///
+    /// Returns an error if the name is not recognized by twemoji_assets.
+    /// Only available when the `twemoji` feature is enabled.
+    #[cfg(feature = "twemoji")]
+    pub fn from_emoji_name(name: &str, position: OverlayPosition, scale: f32) -> Result<Self, RenderError> {
+        Ok(Self {
+            source: SvgSource::from_emoji_name(name)?,
             position,
             scale: scale.clamp(0.0, 1.0),
         })
@@ -88,20 +102,18 @@ impl LayerEffect for SvgOverlayConfig {
         DependencyVersion::NONE
     }
 
-    fn transform(&self, ctx: &mut RenderContext) {
+    fn transform(&self, ctx: &mut RenderContext) -> Result<(), RenderError> {
         // Calculate overlay size based on content bounds
         let bounds = ctx.image.content_bounds;
         let min_dim = bounds.width.min(bounds.height) as f32;
         let overlay_size = (min_dim * self.scale) as u32;
 
         if overlay_size == 0 {
-            return;
+            return Ok(());
         }
 
         // Render the SVG
-        let Some(overlay_img) = render_source(&self.source, overlay_size) else {
-            return;
-        };
+        let overlay_img = render_source(&self.source, overlay_size)?;
 
         // Calculate position based on the position setting
         let (x, y) = self.calculate_position(&bounds, overlay_img.width(), overlay_img.height());
@@ -111,6 +123,7 @@ impl LayerEffect for SvgOverlayConfig {
 
         // Update the IconImage with the modified data
         ctx.image = IconImage::new(ctx.image.data.clone(), ctx.image.scale, ctx.image.content_bounds);
+        Ok(())
     }
 }
 
