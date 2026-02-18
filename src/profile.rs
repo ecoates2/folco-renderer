@@ -49,6 +49,7 @@ use crate::layer::{OverlayPosition, SvgSource};
 /// { "emoji": "🦆" }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SerializableSvgSource {
     /// Raw SVG markup (mutually exclusive with `emoji` and `emoji_name`).
@@ -126,6 +127,7 @@ impl From<SerializableSvgSource> for SvgSource {
 /// Settings are expressed as a **target color** in HSL space. The renderer
 /// computes the necessary deltas from the base icon's surface color.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct HslMutationSettings {
     /// Target hue in degrees (0–360).
@@ -146,6 +148,7 @@ pub struct HslMutationSettings {
 
 /// Serializable settings for decal imprint layer.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct DecalSettings {
     /// The SVG source.
@@ -162,6 +165,7 @@ pub struct DecalSettings {
 
 /// Serializable settings for SVG overlay layer.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct OverlaySettings {
     /// The SVG source.
@@ -181,6 +185,7 @@ pub struct OverlaySettings {
 
 /// Serializable version of [`OverlayPosition`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum SerializablePosition {
     BottomLeft,
@@ -248,6 +253,7 @@ fn default_true() -> bool {
 /// }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct CustomizationProfile {
     /// HSL mutation layer settings. `None` means no config set.
@@ -300,6 +306,18 @@ impl CustomizationProfile {
     /// Deserializes a profile from a JSON string.
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
+    }
+
+    /// Returns the JSON Schema for `CustomizationProfile`.
+    #[cfg(feature = "jsonschema")]
+    pub fn json_schema() -> schemars::schema::RootSchema {
+        schemars::schema_for!(CustomizationProfile)
+    }
+
+    /// Returns the JSON Schema as a pretty-printed JSON string.
+    #[cfg(feature = "jsonschema")]
+    pub fn json_schema_string() -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(&Self::json_schema())
     }
 }
 

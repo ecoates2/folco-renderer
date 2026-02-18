@@ -6,7 +6,7 @@ use crate::error::RenderError;
 use crate::icon::{IconImage, SurfaceColor};
 use palette::{Hsl, IntoColor, Srgb};
 
-const DECAL_DARKEN_AMOUNT: f32 = 0.20;
+const DECAL_DARKEN_AMOUNT: f32 = 0.25;
 
 // ============================================================================
 // DecalConfig
