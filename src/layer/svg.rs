@@ -31,7 +31,9 @@ use crate::error::RenderError;
 /// #[cfg(feature = "twemoji")]
 /// let emoji = SvgSource::from_emoji("🦆").unwrap();
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
 pub enum SvgSource {
     /// Raw SVG markup string.
     Raw(String),
@@ -49,6 +51,27 @@ pub enum SvgSource {
     EmojiName(String),
 }
 
+/// Looks up an emoji in `twemoji_assets`, falling back to a version
+/// with U+FE0F variation selectors stripped.
+///
+/// Some emoji data sources (e.g. `@emoji-mart/data`) append U+FE0F to
+/// emoji characters, while `twemoji_assets` may store certain entries
+/// without it.  This helper tries an exact match first and, if that
+/// fails, retries after removing all FE0F codepoints.
+#[cfg(feature = "twemoji")]
+fn resolve_twemoji(emoji: &str) -> Option<&'static twemoji_assets::svg::SvgTwemojiAsset> {
+    use twemoji_assets::svg::SvgTwemojiAsset;
+
+    SvgTwemojiAsset::from_emoji(emoji).or_else(|| {
+        let cleaned: String = emoji.chars().filter(|&c| c != '\u{FE0F}').collect();
+        if cleaned != emoji {
+            SvgTwemojiAsset::from_emoji(&cleaned)
+        } else {
+            None
+        }
+    })
+}
+
 impl SvgSource {
     /// Creates a source from raw SVG markup.
     pub fn from_svg(svg: impl Into<String>) -> Self {
@@ -59,12 +82,13 @@ impl SvgSource {
     ///
     /// Returns an error if the emoji is not supported by twemoji_assets.
     /// Only available when the `twemoji` feature is enabled.
+    ///
+    /// Automatically falls back to a U+FE0F-stripped lookup when the
+    /// exact match fails, since emoji data sources commonly include the
+    /// variation selector while twemoji indexes some entries without it.
     #[cfg(feature = "twemoji")]
     pub fn from_emoji(emoji: &str) -> Result<Self, RenderError> {
-        use twemoji_assets::svg::SvgTwemojiAsset;
-
-        // Validate that the emoji exists
-        SvgTwemojiAsset::from_emoji(emoji).ok_or_else(|| RenderError::InvalidEmoji {
+        resolve_twemoji(emoji).ok_or_else(|| RenderError::InvalidEmoji {
             emoji: emoji.to_string(),
         })?;
         Ok(Self::Emoji(emoji.to_string()))
@@ -100,8 +124,7 @@ impl SvgSource {
             Self::Raw(svg) => Ok(svg.as_str()),
             #[cfg(feature = "twemoji")]
             Self::Emoji(emoji) => {
-                use twemoji_assets::svg::SvgTwemojiAsset;
-                let asset = SvgTwemojiAsset::from_emoji(emoji).ok_or_else(|| {
+                let asset = resolve_twemoji(emoji).ok_or_else(|| {
                     RenderError::InvalidEmoji {
                         emoji: emoji.clone(),
                     }

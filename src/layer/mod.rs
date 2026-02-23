@@ -1,31 +1,35 @@
 //! Layer infrastructure for icon customization.
 //!
-//! This module provides the generic layer system used by `IconCustomizer`.
-//! Each layer encapsulates a configuration, an enabled state, version tracking
-//! for cache invalidation, and a per-size image cache.
+//! This module provides the generic layer system used by `FolderIconCustomizer`.
+//! Each layer encapsulates an optional configuration, version tracking
+//! for cache invalidation, and a per-size output cache.
 //!
 //! # Architecture
 //!
-//! Each layer config implements [`LayerEffect`], which defines:
-//! - How the layer renders itself
-//! - What properties it emits for downstream layers
-//! - What properties it consumes from upstream layers
+//! Each layer config implements [`LayerConfig`] (pure data with change
+//! detection). Rendering logic lives on the concrete `Layer<Config>` types.
+//!
+//! - **Base layers** (e.g., color target) transform the icon image directly
+//!   and cache the full result.
+//! - **Stackable layers** (e.g., decal, overlay) render to a transparent tile
+//!   of the same dimensions, which the pipeline composites on top.
 //!
 //! Properties flow through the pipeline via [`RenderContext`], enabling
 //! layers to communicate without tight coupling.
 
+pub mod folder_color_target;
 pub mod decal;
-pub mod hsl_mutation;
 pub mod overlay;
 pub mod svg;
 
+pub use folder_color_target::FolderColorTargetConfig;
 pub use decal::DecalConfig;
-pub use hsl_mutation::HslMutationConfig;
 pub use overlay::{OverlayPosition, SvgOverlayConfig};
 pub use svg::SvgSource;
 
 use crate::error::RenderError;
 use crate::icon::{IconImage, SurfaceColor};
+use image::RgbaImage;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 
@@ -90,7 +94,7 @@ impl RenderContext {
 
 /// The dominant color sampled from the image.
 ///
-/// Emitted by layers that modify the image appearance (like HSL mutation).
+/// Emitted by layers that modify the image appearance (like color target).
 /// Consumed by layers that need to derive colors from the image (like decal).
 #[derive(Debug, Clone, Copy)]
 pub struct DominantColor {
@@ -116,53 +120,13 @@ impl DominantColor {
 
 /// Trait for layer configuration types.
 ///
-/// Implementations must detect when a configuration meaningfully differs
-/// from another, which drives cache invalidation.
+/// Configurations are pure data — they hold only the user's settings
+/// and know how to detect meaningful changes for cache invalidation.
+/// Rendering logic lives on the concrete [`Layer`] types.
 pub trait LayerConfig: Clone {
     /// Returns true if this config differs from another in a way that
     /// would produce different rendering output.
     fn differs_from(&self, other: &Self) -> bool;
-}
-
-/// Trait for layer configurations that know how to apply themselves.
-///
-/// This is the core abstraction that makes layers self-contained. Each layer:
-/// - Declares its upstream dependencies for cache invalidation
-/// - Transforms the image in the render context
-/// - Can read properties set by upstream layers
-/// - Emits properties for downstream layers in a dedicated method
-///
-/// The separation of [`transform`](Self::transform) and [`emit`](Self::emit)
-/// provides a canonical place for property emission and makes the data flow
-/// explicit.
-pub trait LayerEffect: LayerConfig {
-    /// Returns the dependency version for cache invalidation.
-    ///
-    /// Layers that depend on upstream layers should combine their versions.
-    /// Root layers (no dependencies) should return `DependencyVersion::NONE`.
-    fn dependencies(versions: &LayerVersions) -> DependencyVersion;
-
-    /// Transform the image in the render context.
-    ///
-    /// Implementations should:
-    /// 1. Read any needed properties from `ctx` (set by upstream layers)
-    /// 2. Modify `ctx.image` as needed
-    ///
-    /// Property emission happens in [`emit`](Self::emit), not here.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the layer fails to render (e.g., SVG parse
-    /// failure or invalid emoji source).
-    fn transform(&self, ctx: &mut RenderContext) -> Result<(), RenderError>;
-
-    /// Emit properties for downstream layers to consume.
-    ///
-    /// Called after [`transform`](Self::transform). The default implementation
-    /// emits nothing. Override this to emit properties like [`DominantColor`].
-    ///
-    /// Properties are emitted via `ctx.set()`.
-    fn emit(&self, _ctx: &mut RenderContext) {}
 }
 
 
@@ -208,8 +172,8 @@ impl DependencyVersion {
 /// which upstream layers it depends on for cache invalidation.
 #[derive(Debug, Clone, Copy)]
 pub struct LayerVersions {
-    /// Version of the HSL mutation layer.
-    pub hsl: u64,
+    /// Version of the color target layer.
+    pub folder_color_target: u64,
     /// Version of the decal layer.
     pub decal: u64,
     /// Version of the overlay layer.
@@ -250,19 +214,45 @@ impl CacheKey {
 // Generic Layer
 // ============================================================================
 
+// ============================================================================
+// Layer Cache Output
+// ============================================================================
+
+/// Cached result from a layer's rendering.
+///
+/// Layers produce different types of output:
+/// - **Image-transforming layers** (e.g., color_target) modify `ctx.image`
+///   directly and cache the full transformed result.
+/// - **Tile layers** (e.g., decal, overlay) render to a transparent canvas
+///   of the same dimensions, which the pipeline composites on top.
+enum CachedOutput {
+    /// Full transformed image (e.g., color_target mutates the base icon).
+    Image(IconImage),
+    /// Transparent tile for compositing (e.g., decal, overlay).
+    Tile(RgbaImage),
+}
+
+// ============================================================================
+// Generic Layer
+// ============================================================================
+
 /// A generic layer with configuration, caching, and version tracking.
 ///
 /// The layer tracks:
 /// - Optional configuration of type `C`
-/// - Whether the layer is enabled (can be toggled without losing config)
+/// - An enabled flag for live toggling (does not affect config or cache)
 /// - A version number that increments on any state change
-/// - A cache of rendered images keyed by size
+/// - A cache of rendered outputs keyed by size
 /// - The dependency version when each cache entry was stored
+///
+/// A layer is considered **active** when it has a configuration set
+/// AND is enabled. The `enabled` flag is for live editing (UI toggles)
+/// and is not serialized into profiles.
 pub struct Layer<C: LayerConfig> {
     config: Option<C>,
     enabled: bool,
     version: u64,
-    cache: HashMap<CacheKey, (IconImage, u64)>,
+    cache: HashMap<CacheKey, (CachedOutput, u64)>,
 }
 
 impl<C: LayerConfig> Default for Layer<C> {
@@ -293,18 +283,24 @@ impl<C: LayerConfig> Layer<C> {
     }
 
     /// Returns whether the layer is enabled.
+    ///
+    /// This is a live-editing toggle that does not affect the stored
+    /// configuration or cached outputs. It is not serialized into profiles.
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
 
     /// Sets whether the layer is enabled.
     ///
+    /// Toggling preserves the layer's configuration and cache.
+    /// Only the version is bumped so downstream/composite caches
+    /// know to re-evaluate.
+    ///
     /// Returns true if the enabled state changed.
     pub fn set_enabled(&mut self, enabled: bool) -> bool {
         if self.enabled != enabled {
             self.enabled = enabled;
             self.version = self.version.wrapping_add(1);
-            self.cache.clear();
             true
         } else {
             false
@@ -344,59 +340,25 @@ impl<C: LayerConfig> Layer<C> {
         self.cache.clear();
     }
 
-    /// Gets a cached image if valid for the given key and dependency version.
-    pub fn get_cached(&self, key: CacheKey, deps: DependencyVersion) -> Option<&IconImage> {
-        self.cache.get(&key).and_then(|(img, stored_dep)| {
+    /// Gets a cached output if valid for the given key and dependency version.
+    fn get_cached(&self, key: CacheKey, deps: DependencyVersion) -> Option<&CachedOutput> {
+        self.cache.get(&key).and_then(|(output, stored_dep)| {
             if *stored_dep == deps.0 {
-                Some(img)
+                Some(output)
             } else {
                 None
             }
         })
     }
 
-    /// Stores an image in the cache with the current dependency version.
-    pub fn store(&mut self, key: CacheKey, image: IconImage, deps: DependencyVersion) {
-        self.cache.insert(key, (image, deps.0));
+    /// Stores a layer output in the cache with the current dependency version.
+    fn store(&mut self, key: CacheKey, output: CachedOutput, deps: DependencyVersion) {
+        self.cache.insert(key, (output, deps.0));
     }
 }
 
-impl<C: LayerEffect> Layer<C> {
-    /// Apply this layer to the render context, using cache if valid.
-    ///
-    /// If the layer is not active, it does nothing (context passes through unchanged).
-    /// If a valid cached result exists, it updates the context image from cache.
-    /// Otherwise, it calls transform() then emit() and caches the result.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `transform()` fails.
-    pub fn apply(&mut self, ctx: &mut RenderContext, key: CacheKey, versions: &LayerVersions) -> Result<(), RenderError> {
-        if !self.is_active() {
-            return Ok(());
-        }
-
-        // Compute dependencies from the trait
-        let deps = C::dependencies(versions);
-
-        // Check cache first
-        if let Some(cached) = self.get_cached(key, deps) {
-            ctx.image = cached.clone();
-            // Re-emit properties (they aren't cached, only the image is)
-            self.config().unwrap().emit(ctx);
-            return Ok(());
-        }
-
-        // Apply the layer: transform then emit
-        let config = self.config().unwrap();
-        config.transform(ctx)?;
-        config.emit(ctx);
-
-        // Cache the result (image only, properties are re-emitted on cache hit)
-        self.store(key, ctx.image.clone(), deps);
-        Ok(())
-    }
-}
+// NOTE: Rendering methods (apply, render_tile) are implemented on `Layer<SpecificConfig>`
+// in each layer module (color_target.rs, decal.rs, overlay.rs).
 
 // ============================================================================
 // Composite Layer
@@ -465,13 +427,13 @@ impl CompositeLayer {
 /// Base Image
 ///     │
 ///     ▼
-/// ┌─────────┐
-/// │   HSL   │ ◄── No dependencies (root layer)
-/// └────┬────┘
+/// ┌──────────────┐
+/// │ Color Target │ ◄── No dependencies (root layer)
+/// └──────┬───────┘
 ///      │
 ///      ▼
 /// ┌─────────┐
-/// │  Decal  │ ◄── Depends on: HSL
+/// │  Decal  │ ◄── Depends on: Color Target
 /// └────┬────┘
 ///      │
 ///      ▼
@@ -481,14 +443,14 @@ impl CompositeLayer {
 ///      │
 ///      ▼
 /// ┌─────────────┐
-/// │  Composite  │ ◄── Depends on: HSL + Decal + Overlay
+/// │  Composite  │ ◄── Depends on: Color Target + Decal + Overlay
 /// └─────────────┘
 /// ```
 pub struct LayerPipeline {
-    /// HSL mutation layer (root - no dependencies).
-    pub hsl: Layer<HslMutationConfig>,
+    /// Color target layer (root - no dependencies).
+    pub folder_color_target: Layer<FolderColorTargetConfig>,
 
-    /// Decal imprint layer (depends on HSL).
+    /// Decal imprint layer (depends on color target).
     pub decal: Layer<DecalConfig>,
 
     /// SVG overlay layer (no dependencies, applied last).
@@ -501,7 +463,7 @@ pub struct LayerPipeline {
 impl Default for LayerPipeline {
     fn default() -> Self {
         Self {
-            hsl: Layer::default(),
+            folder_color_target: Layer::default(),
             decal: Layer::default(),
             overlay: Layer::default(),
             composite: CompositeLayer::default(),
@@ -512,10 +474,10 @@ impl Default for LayerPipeline {
 impl LayerPipeline {
     /// Returns a snapshot of all layer versions.
     ///
-    /// Used by [`LayerEffect::dependencies`] to compute cache invalidation.
+    /// Used by layer `dependencies()` methods to compute cache invalidation.
     pub fn layer_versions(&self) -> LayerVersions {
         LayerVersions {
-            hsl: self.hsl.version(),
+            folder_color_target: self.folder_color_target.version(),
             decal: self.decal.version(),
             overlay: self.overlay.version(),
         }
@@ -523,7 +485,7 @@ impl LayerPipeline {
 
     /// Invalidates all caches.
     pub fn invalidate_all(&mut self) {
-        self.hsl.invalidate();
+        self.folder_color_target.invalidate();
         self.decal.invalidate();
         self.overlay.invalidate();
         self.composite.invalidate();
@@ -532,7 +494,7 @@ impl LayerPipeline {
     /// Returns the combined dependency version for the composite layer.
     fn composite_dependencies(&self) -> DependencyVersion {
         DependencyVersion::combine(&[
-            self.hsl.version(),
+            self.folder_color_target.version(),
             self.decal.version(),
             self.overlay.version(),
         ])
@@ -543,8 +505,9 @@ impl LayerPipeline {
     /// This is the main entry point for rendering. It:
     /// 1. Checks the composite cache first
     /// 2. Creates a render context with the base image and surface color
-    /// 3. Applies each layer in order, passing the context through
-    /// 4. Caches and returns the final result
+    /// 3. Applies the color target (mutates the base image directly)
+    /// 4. Applies tile layers (decal, overlay) and composites their tiles
+    /// 5. Caches and returns the final result
     ///
     /// # Errors
     ///
@@ -564,9 +527,17 @@ impl LayerPipeline {
 
         // Apply layers in order (each layer computes its own dependencies)
         let versions = self.layer_versions();
-        self.hsl.apply(&mut ctx, key, &versions)?;
-        self.decal.apply(&mut ctx, key, &versions)?;
-        self.overlay.apply(&mut ctx, key, &versions)?;
+
+        // Color target transforms ctx.image directly (returns None)
+        self.folder_color_target.apply(&mut ctx, key, &versions)?;
+
+        // Tile layers produce transparent canvases — composite them over ctx.image
+        if let Some(tile) = self.decal.render_tile(&mut ctx, key, &versions)? {
+            svg::composite_over(&mut ctx.image.data, &tile, 0, 0);
+        }
+        if let Some(tile) = self.overlay.render_tile(&mut ctx, key, &versions)? {
+            svg::composite_over(&mut ctx.image.data, &tile, 0, 0);
+        }
 
         // Cache the final result
         self.composite.store(key, ctx.image.clone(), composite_deps);

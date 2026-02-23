@@ -1,28 +1,19 @@
 //! Serializable customization profile for cross-process/WASM communication.
 //!
-//! A [`CustomizationProfile`] captures all layer settings in a format that can
-//! be serialized to JSON and sent between frontend (WASM/Tauri) and backend.
+//! A [`CustomizationProfile`] captures all layer configurations in a format
+//! that can be serialized to JSON and sent between frontend (WASM/Tauri) and
+//! backend. Layer config structs are directly serializable — no intermediate
+//! "settings" types needed.
 //!
 //! # Example
 //!
 //! ```
-//! use folco_renderer::{
-//!     CustomizationProfile, HslMutationSettings, DecalSettings, SerializableSvgSource,
-//! };
+//! use folco_renderer::{CustomizationProfile, FolderColorTargetConfig, DecalConfig, SvgSource};
 //!
-//! // Build a profile
+//! // Build a profile from config structs directly
 //! let profile = CustomizationProfile::new()
-//!     .with_hsl_mutation(HslMutationSettings {
-//!         target_hue: 180.0,
-//!         target_saturation: 0.8,
-//!         target_lightness: 0.5,
-//!         enabled: true,
-//!     })
-//!     .with_decal(DecalSettings {
-//!         source: SerializableSvgSource::from_svg("<svg>...</svg>"),
-//!         scale: 0.5,
-//!         enabled: true,
-//!     });
+//!     .with_folder_color_target(FolderColorTargetConfig::new(33, 150, 243))
+//!     .with_decal(DecalConfig::new("<svg>...</svg>", 0.5));
 //!
 //! // Serialize to JSON for sending to backend
 //! let json = profile.to_json().unwrap();
@@ -33,240 +24,48 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::layer::{OverlayPosition, SvgSource};
-
-// ============================================================================
-// Serializable SVG Source
-// ============================================================================
-
-/// Serializable representation of an SVG source.
-///
-/// This enum serializes to a flat structure with either `svgData` or `emoji` field:
-///
-/// ```json
-/// { "svgData": "<svg>...</svg>" }
-/// // or
-/// { "emoji": "🦆" }
-/// ```
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "camelCase")]
-pub struct SerializableSvgSource {
-    /// Raw SVG markup (mutually exclusive with `emoji` and `emoji_name`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub svg_data: Option<String>,
-
-    /// Emoji character to resolve via twemoji (mutually exclusive with `svg_data` and `emoji_name`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub emoji: Option<String>,
-
-    /// Emoji name to resolve via twemoji (mutually exclusive with `svg_data` and `emoji`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub emoji_name: Option<String>,
-}
-
-impl SerializableSvgSource {
-    /// Creates a source from raw SVG markup.
-    pub fn from_svg(svg: impl Into<String>) -> Self {
-        Self {
-            svg_data: Some(svg.into()),
-            emoji: None,
-            emoji_name: None,
-        }
-    }
-
-    /// Creates a source from an emoji character.
-    pub fn from_emoji(emoji: impl Into<String>) -> Self {
-        Self {
-            svg_data: None,
-            emoji: Some(emoji.into()),
-            emoji_name: None,
-        }
-    }
-
-    /// Creates a source from an emoji name (e.g., "duck").
-    pub fn from_emoji_name(name: impl Into<String>) -> Self {
-        Self {
-            svg_data: None,
-            emoji: None,
-            emoji_name: Some(name.into()),
-        }
-    }
-}
-
-impl From<&SvgSource> for SerializableSvgSource {
-    fn from(source: &SvgSource) -> Self {
-        match source {
-            SvgSource::Raw(svg) => Self::from_svg(svg),
-            SvgSource::Emoji(emoji) => Self::from_emoji(emoji),
-            SvgSource::EmojiName(name) => Self::from_emoji_name(name),
-        }
-    }
-}
-
-impl From<SerializableSvgSource> for SvgSource {
-    fn from(source: SerializableSvgSource) -> Self {
-        if let Some(emoji) = source.emoji {
-            SvgSource::Emoji(emoji)
-        } else if let Some(name) = source.emoji_name {
-            SvgSource::EmojiName(name)
-        } else if let Some(svg) = source.svg_data {
-            SvgSource::Raw(svg)
-        } else {
-            SvgSource::Raw(String::new())
-        }
-    }
-}
-
-// ============================================================================
-// Layer Settings (Serializable)
-// ============================================================================
-
-/// Serializable settings for HSL mutation layer.
-///
-/// Settings are expressed as a **target color** in HSL space. The renderer
-/// computes the necessary deltas from the base icon's surface color.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "camelCase")]
-pub struct HslMutationSettings {
-    /// Target hue in degrees (0–360).
-    pub target_hue: f32,
-
-    /// Target saturation as a fraction (0.0–1.0).
-    #[serde(default)]
-    pub target_saturation: f32,
-
-    /// Target lightness as a fraction (0.0–1.0).
-    #[serde(default)]
-    pub target_lightness: f32,
-
-    /// Whether this layer is enabled.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-/// Serializable settings for decal imprint layer.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "camelCase")]
-pub struct DecalSettings {
-    /// The SVG source.
-    #[serde(flatten)]
-    pub source: SerializableSvgSource,
-
-    /// Scale factor relative to the icon's content bounds (0.0-1.0).
-    pub scale: f32,
-
-    /// Whether this layer is enabled.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-/// Serializable settings for SVG overlay layer.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "camelCase")]
-pub struct OverlaySettings {
-    /// The SVG source.
-    #[serde(flatten)]
-    pub source: SerializableSvgSource,
-
-    /// Position within the icon's content bounds.
-    pub position: SerializablePosition,
-
-    /// Scale factor relative to the icon's content bounds (0.0-1.0).
-    pub scale: f32,
-
-    /// Whether this layer is enabled.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-/// Serializable version of [`OverlayPosition`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "kebab-case")]
-pub enum SerializablePosition {
-    BottomLeft,
-    #[default]
-    BottomRight,
-    TopLeft,
-    TopRight,
-    Center,
-}
-
-impl From<OverlayPosition> for SerializablePosition {
-    fn from(pos: OverlayPosition) -> Self {
-        match pos {
-            OverlayPosition::BottomLeft => Self::BottomLeft,
-            OverlayPosition::BottomRight => Self::BottomRight,
-            OverlayPosition::TopLeft => Self::TopLeft,
-            OverlayPosition::TopRight => Self::TopRight,
-            OverlayPosition::Center => Self::Center,
-        }
-    }
-}
-
-impl From<SerializablePosition> for OverlayPosition {
-    fn from(pos: SerializablePosition) -> Self {
-        match pos {
-            SerializablePosition::BottomLeft => Self::BottomLeft,
-            SerializablePosition::BottomRight => Self::BottomRight,
-            SerializablePosition::TopLeft => Self::TopLeft,
-            SerializablePosition::TopRight => Self::TopRight,
-            SerializablePosition::Center => Self::Center,
-        }
-    }
-}
-
-fn default_true() -> bool {
-    true
-}
+use crate::layer::{FolderColorTargetConfig, DecalConfig, SvgOverlayConfig};
 
 // ============================================================================
 // CustomizationProfile
 // ============================================================================
 
-/// A serializable profile containing all customization settings.
+/// A serializable profile containing all customization configurations.
 ///
 /// This is the primary type for communicating settings between WASM frontend
-/// and native backend. It captures layer configurations and enabled states
-/// in a JSON-friendly format.
+/// and native backend. Each field stores an optional config struct directly.
+/// `Some(config)` means the layer is configured; `None` means it's absent.
 ///
 /// # JSON Format
 ///
 /// ```json
 /// {
-///   "hslMutation": {
-///     "targetHue": 180.0,
-///     "targetSaturation": 0.8,
-///     "targetLightness": 0.5,
-///     "enabled": true
+///   "folderColorTarget": {
+///     "targetR": 33,
+///     "targetG": 150,
+///     "targetB": 243
 ///   },
 ///   "decal": {
-///     "svgData": "<svg>...</svg>",
-///     "scale": 0.5,
-///     "enabled": true
-///   },
-///   "overlay": null
+///     "source": { "raw": "<svg>...</svg>" },
+///     "scale": 0.5
+///   }
 /// }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct CustomizationProfile {
-    /// HSL mutation layer settings. `None` means no config set.
+    /// Color target layer config. `None` means not configured.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub hsl_mutation: Option<HslMutationSettings>,
+    pub folder_color_target: Option<FolderColorTargetConfig>,
 
-    /// Decal imprint layer settings. `None` means no config set.
+    /// Decal imprint layer config. `None` means not configured.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decal: Option<DecalSettings>,
+    pub decal: Option<DecalConfig>,
 
-    /// SVG overlay layer settings. `None` means no config set.
+    /// SVG overlay layer config. `None` means not configured.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub overlay: Option<OverlaySettings>,
+    pub overlay: Option<SvgOverlayConfig>,
 }
 
 impl CustomizationProfile {
@@ -275,21 +74,21 @@ impl CustomizationProfile {
         Self::default()
     }
 
-    /// Sets HSL mutation settings.
-    pub fn with_hsl_mutation(mut self, settings: HslMutationSettings) -> Self {
-        self.hsl_mutation = Some(settings);
+    /// Sets the color target configuration.
+    pub fn with_folder_color_target(mut self, config: FolderColorTargetConfig) -> Self {
+        self.folder_color_target = Some(config);
         self
     }
 
-    /// Sets decal settings.
-    pub fn with_decal(mut self, settings: DecalSettings) -> Self {
-        self.decal = Some(settings);
+    /// Sets the decal configuration.
+    pub fn with_decal(mut self, config: DecalConfig) -> Self {
+        self.decal = Some(config);
         self
     }
 
-    /// Sets overlay settings.
-    pub fn with_overlay(mut self, settings: OverlaySettings) -> Self {
-        self.overlay = Some(settings);
+    /// Sets the overlay configuration.
+    pub fn with_overlay(mut self, config: SvgOverlayConfig) -> Self {
+        self.overlay = Some(config);
         self
     }
 
@@ -328,134 +127,95 @@ impl CustomizationProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layer::{OverlayPosition, SvgSource};
 
     #[test]
     fn profile_serialization_roundtrip() {
         let profile = CustomizationProfile::new()
-            .with_hsl_mutation(HslMutationSettings {
-                target_hue: 180.0,
-                target_saturation: 0.8,
-                target_lightness: 0.5,
-                enabled: true,
-            })
-            .with_decal(DecalSettings {
-                source: SerializableSvgSource::from_svg("<svg></svg>"),
-                scale: 0.5,
-                enabled: false,
-            });
+            .with_folder_color_target(FolderColorTargetConfig::new(33, 150, 243))
+            .with_decal(DecalConfig::new("<svg></svg>", 0.5));
 
         let json = profile.to_json().unwrap();
         let restored = CustomizationProfile::from_json(&json).unwrap();
 
-        assert_eq!(restored.hsl_mutation.as_ref().unwrap().target_hue, 180.0);
-        assert_eq!(restored.hsl_mutation.as_ref().unwrap().target_saturation, 0.8);
-        assert_eq!(restored.hsl_mutation.as_ref().unwrap().target_lightness, 0.5);
-        assert!(restored.hsl_mutation.as_ref().unwrap().enabled);
-        assert_eq!(
-            restored.decal.as_ref().unwrap().source.svg_data.as_deref(),
-            Some("<svg></svg>")
-        );
-        assert!(!restored.decal.as_ref().unwrap().enabled);
+        let ct = restored.folder_color_target.unwrap();
+        assert_eq!(ct.target_r, 33);
+        assert_eq!(ct.target_g, 150);
+        assert_eq!(ct.target_b, 243);
+
+        let decal = restored.decal.unwrap();
+        assert_eq!(decal.source, SvgSource::Raw("<svg></svg>".into()));
+        assert_eq!(decal.scale, 0.5);
+
         assert!(restored.overlay.is_none());
     }
 
     #[test]
     fn profile_json_format() {
-        let profile = CustomizationProfile::new().with_hsl_mutation(HslMutationSettings {
-            target_hue: 90.0,
-            target_saturation: 0.8,
-            target_lightness: 0.5,
-            enabled: true,
-        });
+        let profile = CustomizationProfile::new()
+            .with_folder_color_target(FolderColorTargetConfig::new(76, 175, 80));
 
         let json = profile.to_json_pretty().unwrap();
 
-        // Verify camelCase serialization
-        assert!(json.contains("\"hslMutation\""));
-        assert!(json.contains("\"targetHue\""));
-        assert!(json.contains("\"enabled\""));
+        assert!(json.contains("\"folderColorTarget\""));
+        assert!(json.contains("\"targetR\""));
+        // No "enabled" field
+        assert!(!json.contains("\"enabled\""));
     }
 
     #[test]
     fn profile_apply_to_customizer() {
         use crate::customizer::Configurable;
-        use crate::icon::{IconBase, IconSet, SurfaceColor};
-        use crate::IconCustomizer;
+        use crate::icon::{FolderIconBase, IconSet, SurfaceColor};
+        use crate::FolderIconCustomizer;
 
         let profile = CustomizationProfile::new()
-            .with_hsl_mutation(HslMutationSettings {
-                target_hue: 120.0,
-                target_saturation: 0.8,
-                target_lightness: 0.5,
-                enabled: true,
-            })
-            .with_decal(DecalSettings {
-                source: SerializableSvgSource::from_svg("test-svg"),
-                scale: 0.3,
-                enabled: false, // Disabled but config present
-            });
+            .with_folder_color_target(FolderColorTargetConfig::new(76, 175, 80));
+        // No decal in profile → decal layer should be unconfigured
 
-        let mut customizer = IconCustomizer::new(IconBase::new(IconSet::new(), SurfaceColor::new(44.0, 1.0, 0.72)));
+        let mut customizer = FolderIconCustomizer::new(FolderIconBase::new(IconSet::new(), SurfaceColor::new(255, 217, 112)));
         customizer.apply_profile(&profile);
 
-        // Check HSL — target values are stored directly
-        assert!(customizer.pipeline.hsl.is_active());
-        assert!((customizer.pipeline.hsl.config().unwrap().target_hue - 120.0).abs() < 0.01);
+        assert!(customizer.pipeline.folder_color_target.is_active());
+        assert_eq!(customizer.pipeline.folder_color_target.config().unwrap().target_r, 76);
 
-        // Check decal (has config but disabled)
-        assert!(customizer.pipeline.decal.has_config());
-        assert!(!customizer.pipeline.decal.is_enabled());
+        assert!(!customizer.pipeline.decal.has_config());
         assert!(!customizer.pipeline.decal.is_active());
-        assert_eq!(
-            customizer.pipeline.decal.config().unwrap().source,
-            crate::layer::SvgSource::Raw("test-svg".into())
-        );
     }
 
     #[test]
     fn profile_export_from_customizer() {
         use crate::customizer::Configurable;
-        use crate::icon::{IconBase, IconSet, SurfaceColor};
-        use crate::layer::HslMutationConfig;
-        use crate::IconCustomizer;
+        use crate::icon::{FolderIconBase, IconSet, SurfaceColor};
+        use crate::FolderIconCustomizer;
 
-        let surface = SurfaceColor::new(44.0, 1.0, 0.72);
-        let mut customizer = IconCustomizer::new(IconBase::new(IconSet::new(), surface));
+        let surface = SurfaceColor::new(255, 217, 112);
+        let mut customizer = FolderIconCustomizer::new(FolderIconBase::new(IconSet::new(), surface));
         customizer
             .pipeline
-            .hsl
-            .set_config(Some(HslMutationConfig::new(&surface, 89.0, 1.0, 0.648)));
-        customizer.pipeline.hsl.set_enabled(false);
+            .folder_color_target
+            .set_config(Some(FolderColorTargetConfig::new(76, 175, 80)));
 
         let profile = customizer.export_profile();
 
-        // Export reads target HSL directly from the config
-        assert!(profile.hsl_mutation.is_some());
-        assert!((profile.hsl_mutation.as_ref().unwrap().target_hue - 89.0).abs() < 0.01);
-        assert!((profile.hsl_mutation.as_ref().unwrap().target_saturation - 1.0).abs() < 0.01);
-        assert!((profile.hsl_mutation.as_ref().unwrap().target_lightness - 0.648).abs() < 0.01);
-        assert!(!profile.hsl_mutation.as_ref().unwrap().enabled);
+        let ct = profile.folder_color_target.unwrap();
+        assert_eq!(ct.target_r, 76);
+        assert_eq!(ct.target_g, 175);
+        assert_eq!(ct.target_b, 80);
         assert!(profile.decal.is_none());
         assert!(profile.overlay.is_none());
     }
 
     #[test]
     fn overlay_position_serialization() {
-        let profile = CustomizationProfile::new().with_overlay(OverlaySettings {
-            source: SerializableSvgSource::from_svg("icon"),
-            position: SerializablePosition::TopLeft,
-            scale: 0.25,
-            enabled: true,
-        });
+        let profile = CustomizationProfile::new()
+            .with_overlay(SvgOverlayConfig::new("icon", OverlayPosition::TopLeft, 0.25));
 
         let json = profile.to_json().unwrap();
         assert!(json.contains("\"top-left\""));
 
         let restored = CustomizationProfile::from_json(&json).unwrap();
-        assert_eq!(
-            restored.overlay.unwrap().position,
-            SerializablePosition::TopLeft
-        );
+        assert_eq!(restored.overlay.unwrap().position, OverlayPosition::TopLeft);
     }
 
     #[test]
@@ -463,7 +223,7 @@ mod tests {
         let json = "{}";
         let profile = CustomizationProfile::from_json(json).unwrap();
 
-        assert!(profile.hsl_mutation.is_none());
+        assert!(profile.folder_color_target.is_none());
         assert!(profile.decal.is_none());
         assert!(profile.overlay.is_none());
     }

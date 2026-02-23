@@ -1,9 +1,10 @@
-//! Decal imprint layer configuration and application.
+//! Decal imprint layer — configuration and rendering.
 
 use super::svg::{composite_over, render_source_with_color, SvgSource};
-use super::{DependencyVersion, DominantColor, LayerConfig, LayerEffect, LayerVersions, RenderContext};
+use super::{CacheKey, CachedOutput, DependencyVersion, DominantColor, Layer, LayerConfig, LayerVersions, RenderContext};
 use crate::error::RenderError;
-use crate::icon::{IconImage, SurfaceColor};
+use crate::icon::SurfaceColor;
+use image::RgbaImage;
 use palette::{Hsl, IntoColor, Srgb};
 
 const DECAL_DARKEN_AMOUNT: f32 = 0.25;
@@ -12,19 +13,16 @@ const DECAL_DARKEN_AMOUNT: f32 = 0.25;
 // DecalConfig
 // ============================================================================
 
-/// Configuration for decal imprint.
+/// Configuration for decal imprint — pure data.
 ///
-/// A decal is a **monochrome SVG** rendered at the center of the icon, filled
-/// with a color derived from the underlying pixels (slightly darkened). All
-/// fills and strokes in the SVG are replaced with this computed color.
+/// Stores the SVG source and scale factor. Rendering logic
+/// (color derivation, positioning, compositing) lives on
+/// [`Layer<DecalConfig>`].
 ///
 /// For full-color SVGs or emojis, use [`SvgOverlayConfig`] instead.
-///
-/// # Consumed Properties
-///
-/// - [`DominantColor`]: If set by an upstream layer, uses this color for the decal.
-///   Otherwise, derives the color from the [`SurfaceColor`] in the render context.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
 pub struct DecalConfig {
     /// The SVG source (should be a monochrome/single-color SVG).
     pub source: SvgSource,
@@ -36,25 +34,10 @@ pub struct DecalConfig {
 impl DecalConfig {
     /// Creates a new decal config from an SVG string.
     ///
-    /// Decals are intended for monochrome SVGs that will be uniformly
-    /// colored based on the icon's dominant color. For full-color SVGs
-    /// or emojis, use [`SvgOverlayConfig`] instead.
-    ///
     /// The scale is clamped to 0.0-1.0.
     pub fn new(svg: impl Into<String>, scale: f32) -> Self {
         Self {
             source: SvgSource::Raw(svg.into()),
-            scale: scale.clamp(0.0, 1.0),
-        }
-    }
-
-    /// Creates a decal config from an existing [`SvgSource`].
-    ///
-    /// This is primarily for internal use when deserializing profiles.
-    /// Prefer [`DecalConfig::new`] for normal usage.
-    pub(crate) fn from_source(source: SvgSource, scale: f32) -> Self {
-        Self {
-            source,
             scale: scale.clamp(0.0, 1.0),
         }
     }
@@ -66,55 +49,80 @@ impl LayerConfig for DecalConfig {
     }
 }
 
-impl LayerEffect for DecalConfig {
-    /// Decal depends on the HSL mutation layer (consumes DominantColor).
-    fn dependencies(versions: &LayerVersions) -> DependencyVersion {
-        DependencyVersion::from_version(versions.hsl)
-    }
+// ============================================================================
+// Layer Rendering
+// ============================================================================
 
-    fn transform(&self, ctx: &mut RenderContext) -> Result<(), RenderError> {
-        // Get dominant color from upstream layer, or derive from surface color
-        let dominant_color = ctx
-            .get::<DominantColor>()
-            .map(|c| c.as_tuple())
-            .unwrap_or_else(|| {
-                // No upstream DominantColor — convert surface color to RGB
-                let sc = ctx.get::<SurfaceColor>().expect("SurfaceColor must be set in RenderContext");
-                let hsl = Hsl::new(sc.hue, sc.saturation, sc.lightness);
-                let rgb: Srgb = hsl.into_color();
-                (
-                    (rgb.red * 255.0).round() as u8,
-                    (rgb.green * 255.0).round() as u8,
-                    (rgb.blue * 255.0).round() as u8,
-                    255,
-                )
-            });
-
-        let darkened = darken_color(dominant_color, DECAL_DARKEN_AMOUNT);
-
-        // Calculate decal size based on content bounds
-        let bounds = ctx.image.content_bounds;
-        let min_dim = bounds.width.min(bounds.height) as f32;
-        let decal_size = (min_dim * self.scale) as u32;
-
-        if decal_size == 0 {
-            return Ok(());
+impl Layer<DecalConfig> {
+    /// Render this decal layer, returning a tile for compositing.
+    ///
+    /// Returns `None` if inactive. The tile is a transparent canvas with
+    /// the decal rendered at the center using a darkened version of the
+    /// upstream [`DominantColor`] (or the [`SurfaceColor`] fallback).
+    pub fn render_tile(
+        &mut self,
+        ctx: &mut RenderContext,
+        key: CacheKey,
+        versions: &LayerVersions,
+    ) -> Result<Option<RgbaImage>, RenderError> {
+        if !self.is_active() {
+            return Ok(None);
         }
 
-        // Render the SVG with the darkened color
-        let decal_img = render_source_with_color(&self.source, decal_size, Some(darkened))?;
+        let deps = DependencyVersion::from_version(versions.folder_color_target);
 
-        // Calculate centered position within content bounds
-        let center_x = bounds.x as i32 + (bounds.width as i32 - decal_img.width() as i32) / 2;
-        let center_y = bounds.y as i32 + (bounds.height as i32 - decal_img.height() as i32) / 2;
+        if let Some(CachedOutput::Tile(tile)) = self.get_cached(key, deps) {
+            return Ok(Some(tile.clone()));
+        }
 
-        // Composite the decal onto the image
-        composite_over(&mut ctx.image.data, &decal_img, center_x, center_y);
+        let config = self.config().unwrap();
+        let tile = render_decal(config, ctx)?;
 
-        // Update the IconImage with the modified data
-        ctx.image = IconImage::new(ctx.image.data.clone(), ctx.image.scale, ctx.image.content_bounds);
-        Ok(())
+        self.store(key, CachedOutput::Tile(tile.clone()), deps);
+        Ok(Some(tile))
     }
+}
+
+/// Renders a decal onto a transparent tile matching the icon dimensions.
+///
+/// Uses [`DominantColor`] from the context if available, otherwise falls
+/// back to the [`SurfaceColor`]. The color is darkened before rendering.
+pub(crate) fn render_decal(
+    config: &DecalConfig,
+    ctx: &RenderContext,
+) -> Result<RgbaImage, RenderError> {
+    let dominant_color = ctx
+        .get::<DominantColor>()
+        .map(|c| c.as_tuple())
+        .unwrap_or_else(|| {
+            let sc = ctx
+                .get::<SurfaceColor>()
+                .expect("SurfaceColor must be set in RenderContext");
+            (sc.r, sc.g, sc.b, 255)
+        });
+
+    let darkened = darken_color(dominant_color, DECAL_DARKEN_AMOUNT);
+
+    let bounds = ctx.image.content_bounds;
+    let min_dim = bounds.width.min(bounds.height) as f32;
+    let decal_size = (min_dim * config.scale) as u32;
+
+    let width = ctx.image.data.width();
+    let height = ctx.image.data.height();
+    let mut tile = RgbaImage::new(width, height);
+
+    if decal_size == 0 {
+        return Ok(tile);
+    }
+
+    let decal_img = render_source_with_color(&config.source, decal_size, Some(darkened))?;
+
+    let center_x = bounds.x as i32 + (bounds.width as i32 - decal_img.width() as i32) / 2;
+    let center_y = bounds.y as i32 + (bounds.height as i32 - decal_img.height() as i32) / 2;
+
+    composite_over(&mut tile, &decal_img, center_x, center_y);
+
+    Ok(tile)
 }
 
 // ============================================================================

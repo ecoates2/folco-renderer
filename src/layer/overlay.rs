@@ -1,16 +1,18 @@
-//! SVG overlay layer configuration and application.
+//! SVG overlay layer — configuration and rendering.
 
 use super::svg::{composite_over, render_source, SvgSource};
-use super::{DependencyVersion, LayerConfig, LayerEffect, LayerVersions, RenderContext};
+use super::{CacheKey, CachedOutput, DependencyVersion, Layer, LayerConfig, LayerVersions, RenderContext};
 use crate::error::RenderError;
-use crate::icon::IconImage;
+use image::RgbaImage;
 
 // ============================================================================
 // OverlayPosition
 // ============================================================================
 
 /// Position for SVG overlay placement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
 pub enum OverlayPosition {
     /// Bottom-left corner of content bounds.
     BottomLeft,
@@ -28,16 +30,19 @@ pub enum OverlayPosition {
 // SvgOverlayConfig
 // ============================================================================
 
-/// Configuration for SVG overlay.
+/// Configuration for SVG overlay — pure data.
 ///
-/// An overlay is rendered on top of all other layers at a specified position.
+/// Stores the SVG source, position, and scale. Rendering logic
+/// lives on [`Layer<SvgOverlayConfig>`].
 ///
 /// # SVG Sources
 ///
-/// The overlay accepts any [`SvgSource`], which can be:
+/// Accepts any [`SvgSource`]:
 /// - Raw SVG markup via [`SvgSource::from_svg()`]
 /// - An emoji character via [`SvgSource::from_emoji()`] (requires `twemoji` feature)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
 pub struct SvgOverlayConfig {
     /// The SVG source.
     pub source: SvgSource,
@@ -64,7 +69,6 @@ impl SvgOverlayConfig {
     /// Creates a new overlay config from an emoji.
     ///
     /// Returns an error if the emoji is not supported by twemoji_assets.
-    /// Only available when the `twemoji` feature is enabled.
     #[cfg(feature = "twemoji")]
     pub fn from_emoji(emoji: &str, position: OverlayPosition, scale: f32) -> Result<Self, RenderError> {
         Ok(Self {
@@ -77,7 +81,6 @@ impl SvgOverlayConfig {
     /// Creates a new overlay config from an emoji name (e.g., "duck").
     ///
     /// Returns an error if the name is not recognized by twemoji_assets.
-    /// Only available when the `twemoji` feature is enabled.
     #[cfg(feature = "twemoji")]
     pub fn from_emoji_name(name: &str, position: OverlayPosition, scale: f32) -> Result<Self, RenderError> {
         Ok(Self {
@@ -96,58 +99,84 @@ impl LayerConfig for SvgOverlayConfig {
     }
 }
 
-impl LayerEffect for SvgOverlayConfig {
-    /// Overlay has no upstream dependencies (applied last, on top).
-    fn dependencies(_versions: &LayerVersions) -> DependencyVersion {
-        DependencyVersion::NONE
-    }
+// ============================================================================
+// Layer Rendering
+// ============================================================================
 
-    fn transform(&self, ctx: &mut RenderContext) -> Result<(), RenderError> {
-        // Calculate overlay size based on content bounds
-        let bounds = ctx.image.content_bounds;
-        let min_dim = bounds.width.min(bounds.height) as f32;
-        let overlay_size = (min_dim * self.scale) as u32;
-
-        if overlay_size == 0 {
-            return Ok(());
+impl Layer<SvgOverlayConfig> {
+    /// Render this overlay layer, returning a tile for compositing.
+    ///
+    /// Returns `None` if inactive. The tile is a transparent canvas with
+    /// the SVG rendered at the configured position.
+    pub fn render_tile(
+        &mut self,
+        ctx: &mut RenderContext,
+        key: CacheKey,
+        _versions: &LayerVersions,
+    ) -> Result<Option<RgbaImage>, RenderError> {
+        if !self.is_active() {
+            return Ok(None);
         }
 
-        // Render the SVG
-        let overlay_img = render_source(&self.source, overlay_size)?;
+        let deps = DependencyVersion::NONE; // No upstream dependencies
 
-        // Calculate position based on the position setting
-        let (x, y) = self.calculate_position(&bounds, overlay_img.width(), overlay_img.height());
+        if let Some(CachedOutput::Tile(tile)) = self.get_cached(key, deps) {
+            return Ok(Some(tile.clone()));
+        }
 
-        // Composite the overlay onto the image
-        composite_over(&mut ctx.image.data, &overlay_img, x, y);
+        let config = self.config().unwrap();
+        let tile = render_overlay(config, ctx)?;
 
-        // Update the IconImage with the modified data
-        ctx.image = IconImage::new(ctx.image.data.clone(), ctx.image.scale, ctx.image.content_bounds);
-        Ok(())
+        self.store(key, CachedOutput::Tile(tile.clone()), deps);
+        Ok(Some(tile))
     }
 }
 
-impl SvgOverlayConfig {
-    /// Calculates the (x, y) position for the overlay based on the position setting.
-    fn calculate_position(
-        &self,
-        bounds: &crate::icon::RectPx,
-        overlay_width: u32,
-        overlay_height: u32,
-    ) -> (i32, i32) {
-        let bx = bounds.x as i32;
-        let by = bounds.y as i32;
-        let bw = bounds.width as i32;
-        let bh = bounds.height as i32;
-        let ow = overlay_width as i32;
-        let oh = overlay_height as i32;
+/// Renders an overlay SVG onto a transparent tile at the configured position.
+fn render_overlay(
+    config: &SvgOverlayConfig,
+    ctx: &RenderContext,
+) -> Result<RgbaImage, RenderError> {
+    let bounds = ctx.image.content_bounds;
+    let min_dim = bounds.width.min(bounds.height) as f32;
+    let overlay_size = (min_dim * config.scale) as u32;
 
-        match self.position {
-            OverlayPosition::TopLeft => (bx, by),
-            OverlayPosition::TopRight => (bx + bw - ow, by),
-            OverlayPosition::BottomLeft => (bx, by + bh - oh),
-            OverlayPosition::BottomRight => (bx + bw - ow, by + bh - oh),
-            OverlayPosition::Center => (bx + (bw - ow) / 2, by + (bh - oh) / 2),
-        }
+    let width = ctx.image.data.width();
+    let height = ctx.image.data.height();
+    let mut tile = RgbaImage::new(width, height);
+
+    if overlay_size == 0 {
+        return Ok(tile);
+    }
+
+    let overlay_img = render_source(&config.source, overlay_size)?;
+
+    let (x, y) = calculate_position(config.position, &bounds, overlay_img.width(), overlay_img.height());
+
+    composite_over(&mut tile, &overlay_img, x, y);
+
+    Ok(tile)
+}
+
+/// Calculates the (x, y) position for the overlay based on position setting and bounds.
+fn calculate_position(
+    position: OverlayPosition,
+    bounds: &crate::icon::RectPx,
+    overlay_width: u32,
+    overlay_height: u32,
+) -> (i32, i32) {
+    let bx = bounds.x as i32;
+    let by = bounds.y as i32;
+    let bw = bounds.width as i32;
+    let bh = bounds.height as i32;
+    let ow = overlay_width as i32;
+    let oh = overlay_height as i32;
+
+    match position {
+        OverlayPosition::TopLeft => (bx, by),
+        OverlayPosition::TopRight => (bx + bw - ow, by),
+        OverlayPosition::BottomLeft => (bx, by + bh - oh),
+        OverlayPosition::BottomRight => (bx + bw - ow, by + bh - oh),
+        OverlayPosition::Center => (bx + (bw - ow) / 2, by + (bh - oh) / 2),
     }
 }
